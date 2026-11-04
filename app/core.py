@@ -50,7 +50,40 @@ def init_db():
             id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, action TEXT NOT NULL,
             note TEXT, created_at TEXT NOT NULL
         );
+        -- Automatic CV generation queue/state, one row per job (see app/cv_pipeline.py).
+        -- status: pending | generating | ready | failed | needs_review
+        CREATE TABLE IF NOT EXISTS cv_jobs (
+            job_id INTEGER PRIMARY KEY REFERENCES jobs(id), status TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT 'new', attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT, last_error TEXT, warnings TEXT, notes TEXT,
+            model TEXT, source TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS cv_jobs_due ON cv_jobs(status, next_attempt_at);
         ''')
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_cv_job(job_id):
+    with connect() as db:
+        return db.execute('SELECT * FROM cv_jobs WHERE job_id=?', (job_id,)).fetchone()
+
+
+def set_cv_job(job_id, status, **fields):
+    """Insert or update the cv_jobs row for a job. Unspecified columns keep their value."""
+    allowed = {'reason', 'attempts', 'next_attempt_at', 'last_error', 'warnings', 'notes', 'model', 'source'}
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f'Unknown cv_jobs fields: {sorted(unknown)}')
+    now = now_iso()
+    with connect() as db:
+        db.execute('INSERT OR IGNORE INTO cv_jobs (job_id,status,created_at,updated_at) VALUES (?,?,?,?)',
+                   (job_id, status, now, now))
+        cols = ['status=?', 'updated_at=?'] + [f'{k}=?' for k in fields]
+        db.execute(f'UPDATE cv_jobs SET {",".join(cols)} WHERE job_id=?',
+                   (status, now, *fields.values(), job_id))
 
 
 def clean_markup(value):
@@ -121,27 +154,41 @@ def get_job(job_id):
 
 
 def cv_path(job_id):
-    """Location of the tailored HTML CV for a job (created by `python -m app.tailor_cv`)."""
+    """Location of the tailored HTML CV for a job (app.cv_pipeline or app.tailor_cv)."""
     return ROOT / 'data' / 'cvs' / f'job-{int(job_id)}.html'
 
 
-async def notify(job_id, job):
+def dashboard_base():
+    return os.getenv('APP_BASE_URL', 'http://127.0.0.1:8088').rstrip('/')
+
+
+def review_keyboard(job_id):
+    return {'inline_keyboard': [[{'text': 'Approve draft', 'callback_data': f'approve:{job_id}'},
+                                 {'text': 'Reject', 'callback_data': f'reject:{job_id}'}]]}
+
+
+async def send_telegram(text, reply_markup=None):
+    """Send a Telegram message if configured. Never put dashboard secrets in the text."""
     token = os.getenv('TELEGRAM_BOT_TOKEN')
     chat = os.getenv('TELEGRAM_CHAT_ID')
     if not token or not chat:
-        return
-    base = os.getenv('APP_BASE_URL', 'http://127.0.0.1:8088').rstrip('/')
-    secret = os.getenv('DASHBOARD_TOKEN', '')
-    # Do not embed dashboard secrets in Telegram URLs. Open dashboard and authenticate separately.
-    msg = f"New match ({job['score']}/100)\n{job['title']} — {job['company']}\n{job['location']}\n{job['url']}\nDashboard: {base}"
-    keyboard = {'inline_keyboard': [[{'text': 'Approve draft', 'callback_data': f'approve:{job_id}'},
-                                     {'text': 'Reject', 'callback_data': f'reject:{job_id}'}]]}
+        return False
+    payload = {'chat_id': chat, 'text': text, **({'reply_markup': reply_markup} if reply_markup else {})}
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat, 'text': msg, 'reply_markup': keyboard})
+        resp = await client.post(f'https://api.telegram.org/bot{token}/sendMessage', json=payload)
         resp.raise_for_status()
+    return True
 
 
-async def discover():
+async def notify(job_id, job):
+    # Do not embed dashboard secrets in Telegram URLs. Open dashboard and authenticate separately.
+    msg = f"New match ({job['score']}/100)\n{job['title']} — {job['company']}\n{job['location']}\n{job['url']}\nDashboard: {dashboard_base()}"
+    await send_telegram(msg, review_keyboard(job_id))
+
+
+async def discover(on_new_job=None):
+    """Scan sources and store new matches. `on_new_job(job_id, score)` is called for each
+    newly inserted job (used to queue automatic CV generation; it must be quick)."""
     settings = config('search.yaml')
     source_cfg = settings.get('sources') or {}
     init_db()
@@ -170,11 +217,15 @@ async def discover():
                             job_id = cursor.lastrowid if inserted else None
                         if inserted:
                             new_count += 1
-                            # CVs are tailored on demand via `python -m app.tailor_cv`, never here.
                             try:
                                 await notify(job_id, job)
                             except Exception:
                                 log.exception('Telegram notification failed for job %s', job_id)
+                            if on_new_job:
+                                try:
+                                    on_new_job(job_id, score)
+                                except Exception:
+                                    log.exception('Could not queue CV generation for job %s', job_id)
                     log.info('Finished %s/%s, checked=%s, new=%s', source, board, checked, new_count)
                 except Exception:
                     log.exception('Failed to fetch %s/%s', source, board)
