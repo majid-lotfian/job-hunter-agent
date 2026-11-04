@@ -1,0 +1,17 @@
+[Unit]
+Description=Job Hunter Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_LINUX_USER
+WorkingDirectory=/home/YOUR_LINUX_USER/job-hunter-agent
+EnvironmentFile=/home/YOUR_LINUX_USER/job-hunter-agent/.env
+ExecStart=/home/YOUR_LINUX_USER/job-hunter-agent/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8088
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
