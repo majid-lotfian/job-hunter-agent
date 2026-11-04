@@ -491,9 +491,9 @@ def backfill(cfg=None):
         return 0
     queued = 0
     with connect() as db:
-        rows = db.execute('SELECT j.id FROM jobs j LEFT JOIN cv_jobs c ON c.job_id=j.id '
-                          'WHERE c.job_id IS NULL AND j.score>=? ORDER BY j.score DESC, j.id',
-                          (cfg['min_score'],)).fetchall()
+        rows = db.execute("SELECT j.id FROM jobs j LEFT JOIN cv_jobs c ON c.job_id=j.id "
+                          "WHERE c.job_id IS NULL AND j.score>=? AND COALESCE(j.availability,'active')='active' "
+                          "ORDER BY j.score DESC, j.id", (cfg['min_score'],)).fetchall()
     for row in rows:
         path = cv_path(row['id'])
         if has_marker(path):

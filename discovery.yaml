@@ -77,7 +77,7 @@ sources:
     - {company: conclusion, name: Conclusion}
     - {company: centric, name: Centric}
     - {company: eraneos, name: Eraneos}
-    - {company: dpgmedia, name: DPG Media}
+    # dpgmedia (DPG Media) omitted: its offers listing exceeds the 15 MB response cap (translated descriptions)
     - {company: bunq, name: bunq}
     - {company: nmbrs, name: Nmbrs}
     - {company: funda, name: Funda}
