@@ -60,6 +60,8 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS cv_jobs_due ON cv_jobs(status, next_attempt_at);
         ''')
+    from .discovery import store  # lazy: store imports core
+    store.migrate()
 
 
 def now_iso():
@@ -123,31 +125,6 @@ def score_job(job, settings):
     return min(score, 100)
 
 
-async def fetch_greenhouse(client, board):
-    url = f'https://boards-api.greenhouse.io/v1/boards/{quote(board, safe="")}/jobs?content=true'
-    response = await client.get(url)
-    response.raise_for_status()
-    for item in response.json().get('jobs', []):
-        location = item.get('location') or {}
-        yield dict(source='greenhouse', source_id=str(item['id']), company=board,
-                   title=item.get('title', ''), location=location.get('name', ''),
-                   description=clean_markup(item.get('content', '')),
-                   url=item.get('absolute_url', ''), apply_url=item.get('absolute_url', ''),
-                   published_at=item.get('updated_at'))
-
-
-async def fetch_lever(client, board):
-    response = await client.get(f'https://api.lever.co/v0/postings/{quote(board, safe="")}?mode=json')
-    response.raise_for_status()
-    for item in response.json():
-        categories = item.get('categories') or {}
-        yield dict(source='lever', source_id=item['id'], company=board,
-                   title=item.get('text', ''), location=categories.get('location', ''),
-                   description=clean_markup(item.get('descriptionPlain') or item.get('description', '')),
-                   url=item.get('hostedUrl', ''), apply_url=item.get('applyUrl', ''),
-                   published_at=item.get('createdAt'))
-
-
 def get_job(job_id):
     with connect() as db:
         return db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
@@ -186,51 +163,11 @@ async def notify(job_id, job):
     await send_telegram(msg, review_keyboard(job_id))
 
 
-async def discover(on_new_job=None):
-    """Scan sources and store new matches. `on_new_job(job_id, score)` is called for each
-    newly inserted job (used to queue automatic CV generation; it must be quick)."""
-    settings = config('search.yaml')
-    source_cfg = settings.get('sources') or {}
-    init_db()
-    new_count = 0
-    checked = 0
-    async with httpx.AsyncClient(timeout=25, headers={'User-Agent': 'JobHunterAgent/0.1 (personal job monitoring)'}) as client:
-        for source, boards in source_cfg.items():
-            if source not in ('greenhouse', 'lever'):
-                log.warning('Unsupported source: %s', source)
-                continue
-            for board in boards or []:
-                try:
-                    feed = fetch_greenhouse(client, board) if source == 'greenhouse' else fetch_lever(client, board)
-                    async for job in feed:
-                        checked += 1
-                        score = score_job(job, settings)
-                        if score < int(settings.get('matching', {}).get('min_score', 25)):
-                            continue
-                        job['score'] = score
-                        with connect() as db:
-                            cursor = db.execute('''INSERT OR IGNORE INTO jobs
-                                (source,source_id,company,title,location,description,url,apply_url,published_at,discovered_at,score)
-                                VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
-                                (job['source'],job['source_id'],job['company'],job['title'],job['location'],job['description'],job['url'],job['apply_url'],str(job['published_at'] or ''),datetime.now(timezone.utc).isoformat(),score))
-                            inserted = cursor.rowcount > 0
-                            job_id = cursor.lastrowid if inserted else None
-                        if inserted:
-                            new_count += 1
-                            try:
-                                await notify(job_id, job)
-                            except Exception:
-                                log.exception('Telegram notification failed for job %s', job_id)
-                            if on_new_job:
-                                try:
-                                    on_new_job(job_id, score)
-                                except Exception:
-                                    log.exception('Could not queue CV generation for job %s', job_id)
-                    log.info('Finished %s/%s, checked=%s, new=%s', source, board, checked, new_count)
-                except Exception:
-                    log.exception('Failed to fetch %s/%s', source, board)
-    log.info('Discovery finished: checked=%d, new=%d', checked, new_count)
-    return {'checked': checked, 'new': new_count}
+async def discover(on_new_job=None, force=False):
+    """Scan all configured sources (discovery.yaml + search.yaml boards) and store new matches.
+    `on_new_job(job_id, score)` is called once per new logical job (used to queue CV generation)."""
+    from .discovery.engine import run_discovery  # lazy: engine imports core
+    return await run_discovery(on_new_job=on_new_job, force=force)
 
 
 def transition(job_id, status, note=''):
