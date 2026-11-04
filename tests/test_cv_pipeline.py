@@ -49,6 +49,7 @@ class FakeProvider:
 
     async def generate_json(self, system, prompt, **kwargs):
         self.prompts.append((system, prompt))
+        self.kwargs = kwargs
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
             raise reply
@@ -140,9 +141,9 @@ class GeminiProviderTests(unittest.TestCase):
             (lambda r: httpx.Response(401, json={'error': {'message': 'API key not valid'}}), llm.ConfigurationLLMError),
             (lambda r: httpx.Response(404), llm.ConfigurationLLMError),
             (lambda r: httpx.Response(400), llm.PermanentLLMError),
-            (lambda r: self.ok('{"body_html": "<p>cut', finish='MAX_TOKENS'), llm.PermanentLLMError),
+            (lambda r: self.ok('{"body_html": "<p>cut', finish='MAX_TOKENS'), llm.MalformedResponseError),
             (lambda r: self.ok('{}', finish='SAFETY'), llm.PermanentLLMError),
-            (lambda r: self.ok('not json'), llm.PermanentLLMError),
+            (lambda r: self.ok('not json'), llm.MalformedResponseError),
             (lambda r: httpx.Response(200, json={'promptFeedback': {'blockReason': 'OTHER'}}), llm.PermanentLLMError),
             (lambda r: httpx.Response(200, json={'candidates': []}), llm.TemporaryLLMError),
         ]
@@ -162,6 +163,45 @@ class GeminiProviderTests(unittest.TestCase):
             with self.assertRaises(llm.TemporaryLLMError):
                 run(self.provider(handler).generate_json('s', 'p'))
 
+    def test_malformed_replies_are_retryable(self):
+        self.assertTrue(issubclass(llm.MalformedResponseError, llm.TemporaryLLMError))
+        for text, finish in (('{"body_html": "<p>cut', 'MAX_TOKENS'), ('{"body_html": "<p>x</p>"', 'STOP'),
+                             ('', 'STOP'), ('[1, 2]', 'STOP')):
+            with self.assertRaises(llm.MalformedResponseError, msg=text):
+                run(self.provider(lambda r, t=text, f=finish: self.ok(t, finish=f)).generate_json('s', 'p'))
+
+    def test_structured_output_schema_is_requested(self):
+        seen = []
+
+        def handler(request):
+            seen.append(json.loads(request.content)['generationConfig'])
+            return self.ok('{"body_html": "<p>x</p>", "summary": "", "unsupported_requirements": []}')
+        run(self.provider(handler).generate_json('s', 'p', schema=cv_pipeline.CV_SCHEMA))
+        self.assertEqual(seen[0]['responseMimeType'], 'application/json')
+        self.assertEqual(seen[0]['responseJsonSchema'], cv_pipeline.CV_SCHEMA)
+        self.assertEqual(cv_pipeline.CV_SCHEMA['required'], ['body_html', 'summary', 'unsupported_requirements'])
+
+    def test_schema_rejected_falls_back_to_json_mode_once(self):
+        seen = []
+
+        def handler(request):
+            config = json.loads(request.content)['generationConfig']
+            seen.append('responseJsonSchema' in config)
+            if 'responseJsonSchema' in config:
+                return httpx.Response(400, json={'error': {'status': 'INVALID_ARGUMENT', 'message': 'schema unsupported'}})
+            return self.ok('{"body_html": "<p>x</p>"}')
+        provider = self.provider(handler)
+        self.assertEqual(run(provider.generate_json('s', 'p', schema={'type': 'object'})), {'body_html': '<p>x</p>'})
+        self.assertFalse(provider.schema_supported)
+        run(provider.generate_json('s', 'p', schema={'type': 'object'}))
+        self.assertEqual(seen, [True, False, False])  # schema not retried after the first rejection
+
+    def test_other_400_with_schema_still_fails(self):
+        def handler(request):
+            return httpx.Response(403, json={'error': {'message': 'denied'}})
+        with self.assertRaises(llm.ConfigurationLLMError):
+            run(self.provider(handler).generate_json('s', 'p', schema={'type': 'object'}))
+
     def test_provider_from_env(self):
         with mock.patch.dict(os.environ, {'GEMINI_API_KEY': ''}):
             with self.assertRaisesRegex(llm.ConfigurationLLMError, 'GEMINI_API_KEY'):
@@ -171,6 +211,27 @@ class GeminiProviderTests(unittest.TestCase):
                 llm.provider_from_env()
         with mock.patch.dict(os.environ, {'LLM_PROVIDER': 'gemini', 'GEMINI_API_KEY': 'k', 'LLM_MODEL': 'models/gemini-x'}):
             self.assertEqual(llm.provider_from_env().model, 'gemini-x')
+
+
+class ParseJsonObjectTests(unittest.TestCase):
+    OBJ = {'body_html': '<p class="a">Hi</p>', 'summary': 's', 'unsupported_requirements': []}
+
+    def test_formatting_noise_is_tolerated(self):
+        raw = json.dumps(self.OBJ)
+        for text in (raw, f'  {raw}\n', f'```json\n{raw}\n```', f'```\n{raw}\n```', f'```JSON\r\n{raw}```',
+                     f'\ufeff{raw}', f'Here is the JSON:\n{raw}\nDone.', f'Sure!\n```json\n{raw}\n```\nHope it helps.'):
+            self.assertEqual(llm.parse_json_object(text), self.OBJ, repr(text[:40]))
+
+    def test_raw_newlines_inside_strings_are_accepted(self):
+        text = '{"body_html": "<p>line one\nline two</p>", "summary": "a\tb", "unsupported_requirements": []}'
+        self.assertEqual(llm.parse_json_object(text)['body_html'], '<p>line one\nline two</p>')
+
+    def test_broken_json_is_never_repaired(self):
+        for text in ('', '   ', 'not json', '{"body_html": "<p>cut off', "{'body_html': '<p>x</p>'}",
+                     '{"body_html": "<p class="a">x</p>"}', '```json\n{"body_html": \n```', '[{"body_html": "x"}]',
+                     '"just a string"', '{"a": 1} trailing {"b": 2'):
+            with self.assertRaises(llm.MalformedResponseError, msg=repr(text)):
+                llm.parse_json_object(text)
 
 
 class PipelineTests(unittest.TestCase):
@@ -265,15 +326,21 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('Kubernetes', core.get_cv_job(job_id)['warnings'])
         self.assertIn('needs review', self.sent[0])
 
-    def test_changed_employer_line_or_new_number_needs_review(self):
+    def test_new_number_needs_review(self):
         cv_pipeline.enqueue(self.job)
-        edit = lambda p: {'body_html': tailored(body_of(p)).replace('ML Engineer — Acme BV', 'Senior ML Lead — Acme BV')
-                          .replace('Maintained dashboards.', 'Maintained 40 dashboards.')}
+        edit = lambda p: {'body_html': tailored(body_of(p)).replace('Maintained dashboards.', 'Maintained 40 dashboards.')}
         job_id, status = self.claim_and_process(FakeProvider(edit))
         self.assertEqual(status, 'needs_review')
-        warnings = core.get_cv_job(job_id)['warnings']
-        self.assertIn('Employer/role/date line', warnings)
-        self.assertIn('40', warnings)
+        self.assertIn('40', core.get_cv_job(job_id)['warnings'])
+
+    def test_changed_employer_line_is_rejected(self):
+        cv_pipeline.enqueue(self.job)
+        edit = lambda p: {'body_html': tailored(body_of(p)).replace('ML Engineer — Acme BV', 'Senior ML Lead — Acme BV')}
+        provider = FakeProvider(edit, edit)
+        job_id, status = self.claim_and_process(provider)
+        self.assertEqual(status, 'failed')
+        self.assertIn('Employer/role/date line', provider.prompts[1][1])
+        self.assertFalse((self.cvs / f'job-{job_id}.html').exists())
 
     def test_invalid_output_gets_one_correction_round(self):
         cv_pipeline.enqueue(self.job)
@@ -322,6 +389,82 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(core.get_cv_job(job_id)['attempts'], 3)
         self.assertIn('Gave up after 3 attempts', core.get_cv_job(job_id)['last_error'])
         self.assertIsNone(cv_pipeline.claim_next())  # failed jobs are not retried automatically
+
+    def test_malformed_reply_recovers_in_correction_round(self):
+        cv_pipeline.enqueue(self.job)
+        provider = FakeProvider(llm.MalformedResponseError('Gemini reply was not valid JSON'), good_reply)
+        job_id, status = self.claim_and_process(provider)
+        self.assertEqual(status, 'ready')
+        self.assertEqual(core.get_cv_job(job_id)['attempts'], 1)
+        self.assertIn('not valid JSON', provider.prompts[1][1])
+        self.assertIn('exactly one complete JSON object', provider.prompts[1][1])
+        self.assertEqual(provider.kwargs.get('schema'), cv_pipeline.CV_SCHEMA)
+
+    def test_malformed_replies_back_off_then_recover(self):
+        cv_pipeline.enqueue(self.job)
+        bad = llm.MalformedResponseError('Gemini reply was not valid JSON')
+        cut = llm.MalformedResponseError('Gemini reply was cut off (MAX_TOKENS)')
+        job_id, status = self.claim_and_process(FakeProvider(bad, cut))
+        self.assertEqual(status, 'pending')  # retryable, not failed
+        row = core.get_cv_job(job_id)
+        self.assertIsNotNone(row['next_attempt_at'])
+        self.assertIn('Temporary: Gemini reply was cut off', row['last_error'])
+        self.assertFalse((self.cvs / f'job-{job_id}.html').exists())  # nothing published
+        self.assertEqual(self.sent, [])
+        self.assertIsNone(cv_pipeline.claim_next())  # waits for backoff
+        with core.connect() as db:
+            db.execute('UPDATE cv_jobs SET next_attempt_at=NULL WHERE job_id=?', (job_id,))
+        _, status = self.claim_and_process(FakeProvider(good_reply))
+        self.assertEqual(status, 'ready')
+        row = core.get_cv_job(job_id)
+        self.assertEqual((row['attempts'], row['last_error']), (2, None))
+        self.assertTrue(cv_pipeline.has_marker(self.cvs / f'job-{job_id}.html'))
+
+    def test_persistently_malformed_fails_after_bounded_attempts_without_publishing(self):
+        self.cvs.mkdir(parents=True)
+        legacy = self.cvs / f'job-{self.job}.html'
+        legacy.write_text(MASTER, encoding='utf-8')
+        cv_pipeline.enqueue(self.job, 'legacy')
+        bad = llm.MalformedResponseError('Gemini reply was not valid JSON')
+        provider = FakeProvider(*[bad] * 6)  # 2 rounds x CV_MAX_ATTEMPTS=3
+        statuses = []
+        for _ in range(3):
+            with core.connect() as db:
+                db.execute('UPDATE cv_jobs SET next_attempt_at=NULL WHERE job_id=?', (self.job,))
+            statuses.append(self.claim_and_process(provider)[1])
+        self.assertEqual(statuses, ['pending', 'pending', 'failed'])
+        self.assertEqual(provider.replies, [])
+        row = core.get_cv_job(self.job)
+        self.assertIn('Gave up after 3 attempts', row['last_error'])
+        self.assertEqual(legacy.read_text(encoding='utf-8'), MASTER)  # previous file untouched
+        self.assertFalse((self.tmp / 'tailoring').exists())           # no backup = no replacement
+        self.assertIsNone(cv_pipeline.claim_next())
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('failed', self.sent[0])
+
+    def test_valid_json_with_incomplete_cv_is_never_published(self):
+        self.cvs.mkdir(parents=True)
+        legacy = self.cvs / f'job-{self.job}.html'
+        legacy.write_text(MASTER, encoding='utf-8')
+        cv_pipeline.enqueue(self.job, 'legacy')
+        truncated = lambda p: {'body_html': tailored(body_of(p)).split('<h2>Professional')[0],
+                               'summary': '', 'unsupported_requirements': []}
+        provider = FakeProvider(llm.MalformedResponseError('Gemini reply was not valid JSON'), truncated)
+        job_id, status = self.claim_and_process(provider)
+        self.assertEqual(status, 'failed')
+        error = core.get_cv_job(job_id)['last_error']
+        self.assertIn('Section missing or renamed', error)
+        self.assertIn('Professional Experience', error)
+        self.assertEqual(legacy.read_text(encoding='utf-8'), MASTER)  # old file kept, nothing published
+
+    def test_incomplete_first_reply_recovers_after_feedback(self):
+        cv_pipeline.enqueue(self.job)
+        truncated = lambda p: {'body_html': tailored(body_of(p)).split('<h2>Professional')[0]}
+        provider = FakeProvider(truncated, good_reply)
+        job_id, status = self.claim_and_process(provider)
+        self.assertEqual(status, 'ready')
+        self.assertIn('Professional Experience', provider.prompts[1][1])
+        self.assertIn('ML Engineer — Acme BV', (self.cvs / f'job-{job_id}.html').read_text(encoding='utf-8'))
 
     def test_backoff_is_bounded(self):
         cfg = {**cv_pipeline.settings(), 'retry_base': 60, 'retry_max': 3600}

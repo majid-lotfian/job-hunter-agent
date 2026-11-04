@@ -9,11 +9,13 @@ Configuration comes only from the environment (.env), never from source code:
 
 Errors are classified so the caller can decide what to do:
     TemporaryLLMError     -> retry later with backoff (429, 5xx, timeouts, network)
+    MalformedResponseError-> (a TemporaryLLMError) reply was not a complete JSON object; retry
     ConfigurationLLMError -> do not burn attempts; fix .env (missing/invalid key, unknown model)
     PermanentLLMError     -> this request will not succeed as-is (blocked, malformed reply)
 """
 import json
 import os
+import re
 
 import httpx
 
@@ -33,12 +35,47 @@ class TemporaryLLMError(LLMError):
         self.retry_after = retry_after
 
 
+class MalformedResponseError(TemporaryLLMError):
+    """The reply was empty, truncated or not a JSON object. Retryable: sampling again usually works."""
+
+
 class ConfigurationLLMError(LLMError):
     pass
 
 
 class PermanentLLMError(LLMError):
     pass
+
+
+FENCE = re.compile(r'```[ \t]*(?:json|JSON)?[ \t]*\r?\n(.*?)\r?\n?```', re.S)
+
+
+def parse_json_object(text):
+    """Parse a model reply that should be one JSON object.
+
+    Tolerates only formatting noise: surrounding whitespace/BOM, a Markdown code fence,
+    raw control characters (e.g. literal newlines) inside strings, and short text before
+    or after the object. It never repairs the JSON itself (no guessing at quotes or
+    truncated content); anything else raises MalformedResponseError.
+    """
+    text = (text or '').strip().lstrip('\ufeff').strip()
+    if not text:
+        raise MalformedResponseError('Gemini reply was empty')
+    fenced = FENCE.search(text)
+    candidates = [fenced.group(1).strip()] if fenced else []
+    candidates.append(text)
+    start, end = text.find('{'), text.rfind('}')
+    if 0 <= start < end and not set(text[:start] + text[end + 1:]) & set('{}[]'):
+        candidates.append(text[start:end + 1])  # plain prose around one object, nothing JSON-like
+    for candidate in candidates:
+        try:
+            result = json.loads(candidate, strict=False)
+        except ValueError:
+            continue
+        if isinstance(result, dict):
+            return result
+        raise MalformedResponseError('Gemini reply was JSON but not an object')
+    raise MalformedResponseError('Gemini reply was not valid JSON')
 
 
 def _retry_after(response):
@@ -65,6 +102,7 @@ class GeminiProvider:
         self._api_key = api_key
         self._timeout = timeout
         self._transport = transport  # injectable for tests
+        self.schema_supported = True    # set False if the model rejects responseJsonSchema
 
     def _client(self):
         return httpx.AsyncClient(timeout=self._timeout, transport=self._transport,
@@ -89,15 +127,32 @@ class GeminiProvider:
         except ValueError:
             raise TemporaryLLMError('Gemini returned a non-JSON response') from None
 
-    async def generate_json(self, system, prompt, temperature=0.2, max_output_tokens=32768):
-        """Return the model's reply parsed as a JSON object."""
+    async def generate_json(self, system, prompt, temperature=0.2, max_output_tokens=32768, schema=None):
+        """Return the model's reply parsed as a JSON object.
+
+        Uses JSON mode (responseMimeType=application/json) and, when `schema` is given,
+        structured output (responseJsonSchema). If the model rejects the schema with
+        HTTP 400, it falls back to plain JSON mode for the rest of this provider's life.
+        """
+        config = {'temperature': temperature, 'maxOutputTokens': max_output_tokens,
+                  'responseMimeType': 'application/json'}
         body = {
             'systemInstruction': {'parts': [{'text': system}]},
             'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
-            'generationConfig': {'temperature': temperature, 'maxOutputTokens': max_output_tokens,
-                                 'responseMimeType': 'application/json'},
+            'generationConfig': config,
         }
-        data = await self._request('POST', f'{GEMINI_BASE}/models/{self.model}:generateContent', json=body)
+        url = f'{GEMINI_BASE}/models/{self.model}:generateContent'
+        if schema is not None and self.schema_supported:
+            try:
+                data = await self._request('POST', url, json={**body, 'generationConfig': {
+                    **config, 'responseJsonSchema': schema}})
+            except PermanentLLMError as exc:
+                if 'HTTP 400' not in str(exc):
+                    raise
+                self.schema_supported = False
+                data = await self._request('POST', url, json=body)
+        else:
+            data = await self._request('POST', url, json=body)
         block = (data.get('promptFeedback') or {}).get('blockReason')
         if block:
             raise PermanentLLMError(f'Gemini blocked the prompt: {block}')
@@ -109,19 +164,11 @@ class GeminiProvider:
         text = ''.join(p.get('text', '') for p in (candidate.get('content') or {}).get('parts', [])
                        if not p.get('thought'))
         if finish == 'MAX_TOKENS':
-            raise PermanentLLMError('Gemini reply was cut off (MAX_TOKENS)')
+            # Incomplete output is never parsed or used, but a new sample may fit.
+            raise MalformedResponseError('Gemini reply was cut off (MAX_TOKENS)')
         if finish not in ('STOP', '', 'FINISH_REASON_UNSPECIFIED'):
             raise PermanentLLMError(f'Gemini stopped generating: {finish}')
-        text = text.strip()
-        if text.startswith('```'):
-            text = text.split('\n', 1)[-1].rsplit('```', 1)[0]
-        try:
-            result = json.loads(text)
-        except ValueError:
-            raise PermanentLLMError('Gemini reply was not valid JSON') from None
-        if not isinstance(result, dict):
-            raise PermanentLLMError('Gemini reply was not a JSON object')
-        return result
+        return parse_json_object(text)
 
     async def describe_model(self):
         """models.get for the configured model (used by `--check`)."""

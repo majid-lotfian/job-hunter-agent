@@ -218,6 +218,19 @@ Reply with a JSON object only:
  "unsupported_requirements": ["<job requirement not supported by the master CV>", ...]}"""
 
 
+# Structured output schema (Gemini responseJsonSchema); the reply is still fully validated.
+CV_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'body_html': {'type': 'string', 'description': 'Tailored content of <body>, with placeholders kept.'},
+        'summary': {'type': 'string'},
+        'unsupported_requirements': {'type': 'array', 'items': {'type': 'string'}},
+    },
+    'required': ['body_html', 'summary', 'unsupported_requirements'],
+    'additionalProperties': False,
+}
+
+
 def build_prompt(redacted_body, job, feedback=None):
     description = (job['description'] or '(no description captured)')[:MAX_JOB_DESCRIPTION]
     parts = [
@@ -279,16 +292,32 @@ def unsupported_terms(master_text, draft_text, job):
     return sorted(flagged)
 
 
+def completeness_errors(master_html, document):
+    """Hard checks for unattended output: an incomplete CV is never published."""
+    errors = []
+    master = BeautifulSoup(master_html, 'html.parser')
+    draft = BeautifulSoup(document, 'html.parser')
+    draft_text = _norm(draft.get_text(' '))
+    d_heads = [_norm(h.get_text(' ')) for h in draft.find_all('h2')]
+    for head in (_norm(h.get_text(' ')) for h in master.find_all('h2')):
+        if head not in d_heads:
+            errors.append(f'Section missing or renamed (keep it exactly): {head}')
+    for el in master.select('.job, .meta, .date'):
+        text = _norm(el.get_text(' '))
+        if text and text not in draft_text:
+            errors.append(f'Employer/role/date line changed or missing (keep it verbatim): {text[:80]}')
+    m_len = len(_norm(master.get_text(' ')))
+    if m_len and len(draft_text) / m_len < 0.5:
+        errors.append(f'CV is much shorter than the master ({len(draft_text) / m_len:.0%}); it looks incomplete')
+    return errors
+
+
 def review_checks(master_html, document, job):
     """Extra heuristics for unattended output. Any hit -> needs_review (CV still saved)."""
     warnings = []
     master = BeautifulSoup(master_html, 'html.parser')
     draft = BeautifulSoup(document, 'html.parser')
     draft_text = _norm(draft.get_text(' '))
-    for el in master.select('.job, .meta, .date'):
-        text = _norm(el.get_text(' '))
-        if text and text not in draft_text:
-            warnings.append(f'Employer/role/date line changed or missing: {text[:80]}')
     m_len = len(_norm(master.get_text(' ')))
     if m_len and not 0.6 <= len(draft_text) / m_len <= 1.4:
         warnings.append(f'Length changed a lot ({len(draft_text) / m_len:.0%} of the master CV)')
@@ -321,9 +350,17 @@ async def generate(job, provider, max_rounds=2):
         raise PipelineError(f'Private master CV missing: {MASTER}')
     master_html = MASTER.read_text(encoding='utf-8')
     redactor = Redactor(master_html)
-    feedback = None
+    feedback, malformed = None, None
     for _ in range(max_rounds):
-        reply = await provider.generate_json(SYSTEM_PROMPT, build_prompt(redactor.redacted_body, job, feedback))
+        try:
+            reply = await provider.generate_json(SYSTEM_PROMPT, build_prompt(redactor.redacted_body, job, feedback),
+                                                 schema=CV_SCHEMA)
+        except llm.MalformedResponseError as exc:
+            malformed = exc
+            feedback = [f'{exc}. Reply with exactly one complete JSON object with the keys '
+                        'body_html, summary and unsupported_requirements, and nothing else.']
+            continue
+        malformed = None
         body = reply.get('body_html')
         if not isinstance(body, str) or not body.strip():
             feedback = ['"body_html" was missing or empty.']
@@ -335,6 +372,8 @@ async def generate(job, provider, max_rounds=2):
             continue
         document = assemble(master_html, restored, job['id'], f'{provider.name}:{provider.model}')
         errors, warnings = validate_draft(master_html, document)
+        errors += completeness_errors(master_html, document)
+        warnings = [w for w in warnings if not w.startswith('Section heading missing')]  # now an error
         if _norm(BeautifulSoup(restored, 'html.parser').get_text(' ')) == \
                 _norm(BeautifulSoup(extract_body(master_html), 'html.parser').get_text(' ')):
             errors.append('The CV text is unchanged; tailor it for this job.')
@@ -346,6 +385,8 @@ async def generate(job, provider, max_rounds=2):
         notes = {'summary': str(reply.get('summary', ''))[:1000],
                  'unsupported_requirements': [str(g)[:200] for g in gaps[:15]] if isinstance(gaps, list) else []}
         return document, warnings, notes
+    if malformed is not None:
+        raise malformed  # retryable: process() schedules a bounded backoff retry
     raise ValueError('Generated CV failed validation: ' + '; '.join(feedback or [])[:900])
 
 
