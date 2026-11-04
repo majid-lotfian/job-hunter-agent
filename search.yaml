@@ -1,0 +1,13 @@
+# Enter the board tokens/slugs of companies you want to monitor.
+# Greenhouse example: https://boards.greenhouse.io/COMPANY
+# Lever example: https://jobs.lever.co/COMPANY
+sources:
+  greenhouse: []
+  lever: []
+matching:
+  titles_any: [AI Engineer, Machine Learning Engineer, Applied AI, AI Scientist, LLM Engineer]
+  keywords_any: [LLM, agentic, RAG, fine-tuning, foundation model, Python]
+  locations_any: [Netherlands, Amsterdam, Remote, Europe]
+  excluded_terms: [intern, internship]
+  min_score: 25
+  max_age_days: 30

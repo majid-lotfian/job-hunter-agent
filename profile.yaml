@@ -1,0 +1,20 @@
+name: Your Name
+headline: AI Engineer
+email: your.email@example.com
+location: Netherlands
+summary: Experienced software engineer working on AI systems and production software.
+skills:
+  - Python
+  - FastAPI
+  - LLMs
+  - RAG
+  - Docker
+experience:
+  - role: AI Engineer
+    organization: Example Organization
+    period: 2024–present
+    highlights:
+      - Built and deployed production software services.
+links:
+  github: https://github.com/your-user
+  linkedin: https://linkedin.com/in/your-user
