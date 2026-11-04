@@ -77,7 +77,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title='Job Hunter Agent', lifespan=lifespan)
 
-NO_STORE = {'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY'}
+NO_STORE = {'Cache-Control': 'no-store', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'DENY'}
 
 
 class StatusChange(BaseModel):

@@ -149,6 +149,75 @@ class AuthTests(unittest.TestCase):
         r = c.post('/login', data={'token': TOKEN}, headers={'Origin': 'https://evil.example'})
         self.assertEqual(r.status_code, 403)
 
+    def test_localhost_tunnel_login_accepted(self):
+        # Regression: browser form POSTs through the SSH tunnel were rejected as cross-site.
+        cases = [
+            ('http://localhost:8088', {'Origin': 'http://localhost:8088'}),
+            ('http://127.0.0.1:8088', {'Origin': 'http://127.0.0.1:8088'}),
+            ('http://localhost:9000', {'Origin': 'http://localhost:9000'}),  # other local tunnel port
+            ('http://localhost:8088', {'Origin': 'http://LOCALHOST:8088/'}),
+            ('http://localhost', {'Origin': 'http://localhost'}),
+            # Origin: null (opaque) as sent under Referrer-Policy: no-referrer, rescued by Sec-Fetch-Site
+            ('http://localhost:8088', {'Origin': 'null', 'Sec-Fetch-Site': 'same-origin'}),
+            ('http://127.0.0.1:8088', {'Origin': 'null', 'Sec-Fetch-Site': 'same-origin'}),
+            ('http://localhost:8088', {}),  # non-browser client, no Origin
+        ]
+        for base, headers in cases:
+            auth._failures.clear()
+            c = TestClient(main.app, base_url=base, follow_redirects=False)
+            r = c.post('/login', data={'token': TOKEN}, headers=headers)
+            self.assertEqual(r.status_code, 303, (base, headers))
+            self.assertIn(auth.COOKIE_NAME, r.headers.get('set-cookie', ''), (base, headers))
+
+    def test_localhost_cross_site_and_mismatched_origins_rejected(self):
+        cases = [
+            ('http://localhost:8088', {'Origin': 'https://evil.example'}),
+            ('http://localhost:8088', {'Origin': 'http://localhost:9999'}),  # other local app
+            ('http://localhost:8088', {'Origin': 'http://127.0.0.1:8088'}),  # different origin
+            ('http://127.0.0.1:8088', {'Origin': 'http://localhost:8088'}),
+            ('http://localhost:8088', {'Origin': 'http://localhost.evil.example:8088'}),
+            ('http://localhost:8088', {'Origin': 'http://evil.example@localhost:8088'}),
+            ('http://localhost:8088', {'Origin': 'null'}),
+            ('http://localhost:8088', {'Origin': 'file://'}),
+            ('http://localhost:8088', {'Origin': 'http://localhost:8088', 'Sec-Fetch-Site': 'cross-site'}),
+            ('http://localhost:8088', {'Origin': 'http://localhost:8088', 'Sec-Fetch-Site': 'same-site'}),
+            ('http://localhost:8088', {'Origin': 'null', 'Sec-Fetch-Site': 'cross-site'}),
+        ]
+        for base, headers in cases:
+            c = TestClient(main.app, base_url=base, follow_redirects=False)
+            r = c.post('/login', data={'token': TOKEN}, headers=headers)
+            self.assertEqual(r.status_code, 403, (base, headers))
+            self.assertNotIn(auth.COOKIE_NAME, r.headers.get('set-cookie', ''), (base, headers))
+
+    def test_same_origin_default_ports_and_ipv6(self):
+        from starlette.requests import Request as StarletteRequest
+
+        def req(host, origin):
+            headers = [(b'host', host.encode()), (b'origin', origin.encode())]
+            return StarletteRequest({'type': 'http', 'method': 'POST', 'headers': headers})
+        self.assertTrue(auth.same_origin(req('localhost:80', 'http://localhost')))
+        self.assertTrue(auth.same_origin(req('example.test', 'https://example.test:443')))
+        self.assertTrue(auth.same_origin(req('[::1]:8088', 'http://[::1]:8088')))
+        self.assertFalse(auth.same_origin(req('localhost:443', 'http://localhost')))
+        self.assertFalse(auth.same_origin(req('localhost:8088', 'http://localhost:8088/path')))
+        self.assertFalse(auth.same_origin(req('', 'http://localhost:8088')))
+        self.assertFalse(auth.same_origin(req('localhost:8088', 'http://localhost:notaport')))
+
+    def test_authenticated_api_post_from_localhost_dashboard(self):
+        c = TestClient(main.app, base_url='http://localhost:8088', follow_redirects=False)
+        c.cookies.set(auth.COOKIE_NAME, auth.new_session())
+        r = c.post(f'/api/jobs/{self.job_id}/status', json={'status': 'approved', 'note': ''},
+                   headers={'Origin': 'http://localhost:8088', 'Sec-Fetch-Site': 'same-origin'})
+        self.assertEqual(r.status_code, 200)
+        r = c.post(f'/api/jobs/{self.job_id}/status', json={'status': 'approved', 'note': ''},
+                   headers={'Origin': 'http://localhost:9999', 'Sec-Fetch-Site': 'same-site'})
+        self.assertEqual(r.status_code, 403)
+
+    def test_pages_do_not_force_opaque_origin(self):
+        # Referrer-Policy: no-referrer makes browsers send Origin: null on same-origin POSTs.
+        policy = client().get('/login').headers['referrer-policy']
+        self.assertEqual(policy, 'same-origin')
+
     def test_failed_logins_are_throttled(self):
         c = client()
         for _ in range(auth.MAX_FAILURES):

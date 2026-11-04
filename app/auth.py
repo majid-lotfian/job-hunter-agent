@@ -14,6 +14,7 @@ import re
 import secrets
 import time
 from collections import defaultdict, deque
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request
 
@@ -81,13 +82,42 @@ def require_api_session(request: Request):
         raise HTTPException(401, 'Not logged in')
 
 
+_DEFAULT_PORTS = {'http': 80, 'https': 443}
+
+
+def _authority(scheme, netloc):
+    """Normalise host[:port] for comparison: lower-case, default port dropped."""
+    try:
+        parts = urlsplit(f'//{netloc}')
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not host or parts.username is not None or parts.path or parts.query or parts.fragment:
+        return None
+    if ':' in host:  # IPv6 literal
+        host = f'[{host}]'
+    return host if port in (None, _DEFAULT_PORTS[scheme]) else f'{host}:{port}'
+
+
 def same_origin(request: Request):
-    """Reject cross-site state-changing requests (defence in depth on top of SameSite=Lax)."""
+    """Reject cross-site state-changing requests (defence in depth on top of SameSite=Lax).
+
+    Sec-Fetch-Site is set by the browser and cannot be forged by page script, so it is
+    authoritative when present. Otherwise the Origin header must match Host. A missing
+    Origin (non-browser clients) is allowed; an opaque ``Origin: null`` is rejected.
+    """
+    fetch_site = request.headers.get('sec-fetch-site')
+    if fetch_site is not None:
+        return fetch_site.strip().lower() in ('same-origin', 'none')
     origin = request.headers.get('origin')
     if origin is None:
         return True
-    host = request.headers.get('host', '')
-    return re.sub(r'^https?://', '', origin).rstrip('/') == host
+    parts = urlsplit(origin.strip())
+    if parts.scheme not in _DEFAULT_PORTS or parts.path not in ('', '/') or parts.query or parts.fragment:
+        return False  # includes 'null'
+    expected = _authority(parts.scheme, parts.netloc)
+    actual = _authority(parts.scheme, request.headers.get('host', ''))
+    return expected is not None and expected == actual
 
 
 def safe_next(value):
