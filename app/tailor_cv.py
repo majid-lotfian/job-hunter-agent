@@ -1,4 +1,8 @@
-"""Interactive, user-initiated CV tailoring with Claude Code (no paid API calls).
+"""Optional manual fallback: interactive CV tailoring with Claude Code.
+
+CVs are normally generated automatically by app/cv_pipeline.py (Gemini API). Use this
+workflow when you want to tailor or revise a CV by hand, e.g. for a job below the
+automatic score threshold or one whose automatic CV failed or needs review.
 
 Workflow (run on the VM from the project directory):
 
@@ -21,11 +25,12 @@ from datetime import datetime, timezone
 
 from bs4 import BeautifulSoup
 
-from .core import ROOT, connect, cv_path, get_job, init_db
+from .core import ROOT, connect, cv_path, get_job, init_db, set_cv_job
 
 MASTER = ROOT / 'data' / 'master_cv.html'
 WORKSPACES = ROOT / 'data' / 'tailoring'
 MARKER = 'job-hunter-tailored-for'
+GENERATOR = 'job-hunter-generated-by'
 
 
 def workspace(job_id):
@@ -190,6 +195,15 @@ def validate_draft(master_html, draft_html):
         errors.append('<style> CSS differs from the master CV; the design must be preserved.')
     if draft.find('script'):
         errors.append('Draft contains <script>; not allowed.')
+    active = ['form', 'object', 'embed', 'base', 'svg', 'video', 'audio']
+    if len(draft.find_all(active)) > len(master.find_all(active)):
+        errors.append('Draft adds active or embedded elements (form/object/embed/base/svg/media).')
+    own_meta = {MARKER, GENERATOR}
+    if len([m for m in draft.find_all('meta') if m.get('name') not in own_meta]) > len(master.find_all('meta')):
+        errors.append('Draft adds <meta> elements not in the master CV.')
+    handlers = sorted({a for t in draft.find_all(True) for a in t.attrs if a.lower().startswith('on')})
+    if handlers:
+        errors.append(f'Draft contains inline event handlers: {", ".join(handlers)}')
     if draft.find(['link', 'iframe', 'img']) and not master.find(['link', 'iframe', 'img']):
         errors.append('Draft adds external resources (link/iframe/img) not in the master.')
     m_h1, d_h1 = master.find('h1'), draft.find('h1')
@@ -261,6 +275,8 @@ def finalize(job, force=False):
     output.write_text(document, encoding='utf-8')
     with connect() as db:
         db.execute('UPDATE jobs SET cv_path=? WHERE id=?', (str(output), job_id))
+    set_cv_job(job_id, 'needs_review' if warnings else 'ready', source='claude-code',
+               warnings='\n'.join(warnings) or None, last_error=None, next_attempt_at=None)
     print(f'Saved tailored CV to {rel(output)} and updated the job record. '
           f'Open it from the dashboard ("HTML CV" button for job #{job_id}).')
 
