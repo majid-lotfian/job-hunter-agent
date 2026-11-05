@@ -5,6 +5,13 @@
 - **Date:** 2026-11-05 10:56 (Europe/Amsterdam) · **Author:** Claude Code (Opus 5.5)
 - **Status:** open - not merged, not deployed, no service restarted
 
+## Decisions needed from the owner (summary)
+
+1. **Scoring weights:** accept the new weights (§3)? 78 of 198 live-test jobs are CV-eligible (score ≥ 70), which is about 16 days of backlog at `CV_DAILY_LIMIT=5`. `CV_MIN_SCORE` stays 70 unless you decide otherwise.
+2. **Telegram:** is losing the per-job approve/reject buttons acceptable? The digests link to the dashboard instead.
+3. **Optional sources:** add free Adzuna/Jooble API keys? Until then they stay `not_configured`.
+4. **Merge and deploy:** do you approve merging PR #6 and deploying it (§13)? On the VM, deploying needs `git stash` → `git merge --ff-only` → `git stash pop`, because the PR also changes `app/main.py`, which has a VM-local edit. I verified that the VM patch re-applies cleanly. Only `job-hunter.service` would be restarted.
+
 > Legend: **Implemented** = code in this PR · **Unit-tested** = automated tests · **Live-verified** = observed against
 > real endpoints/data on the VM, always on a *copy* of the production DB · **Assumed/Proposed** = not verified.
 
@@ -232,6 +239,7 @@ All runs used **copies of the production database** in a scratch directory, with
 1. **Review the new scoring weights** (§3). With them, 78 of 198 jobs are CV-eligible; at 5 per day that's about 16 days of backlog. Raising `CV_MIN_SCORE` would shorten it, but it was kept at 70 as instructed.
 2. **Confirm that losing the Telegram approve/reject buttons is acceptable.** The digest links to the dashboard instead.
 3. Adzuna and Jooble remain unconfigured until you add free API keys.
+4. Approval to merge PR #6 and deploy it (§13).
 
 ## 13. Deployment instructions (after review and approval)
 
