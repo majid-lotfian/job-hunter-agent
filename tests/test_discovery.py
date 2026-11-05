@@ -3,6 +3,7 @@
 Deterministic: every HTTP call goes through httpx.MockTransport; temporary SQLite DB only.
 """
 import asyncio
+import copy
 import json
 import os
 import sqlite3
@@ -428,7 +429,7 @@ class FakeSource(Source):
         if self.error:
             raise self.error
         for r in self.records:
-            yield r
+            yield copy.deepcopy(r)  # real adapters build fresh records on every fetch
 
 
 def rec(source_key='greenhouse:acme', job_id='1', title='Senior Machine Learning Engineer', employer='Acme', location='Amsterdam',
@@ -625,6 +626,25 @@ class EngineTests(unittest.TestCase):
         self.assertEqual([tiers[j] for j, _ in self.queued], ['primary'])   # 'possible' tier never queued; no repeats
         self.assertGreaterEqual(self.queued[0][1], 70)
 
+    def test_rejected_detail_postings_are_not_refetched_until_changed(self):
+        class DetailSource(FakeSource):
+            details = 0
+
+            async def detail(self, http, record):
+                DetailSource.details += 1
+                record.description, record.needs_detail = 'Payments backend in Java only.', False
+                return record
+        stub = lambda marker: JobRecord(source_key='greenhouse:acme', source_job_id='9', title='Software Engineer',
+                                        url='https://boards.greenhouse.io/acme/jobs/9', location='Amsterdam',
+                                        updated_marker=marker, needs_detail=True)
+        src = DetailSource('greenhouse:acme', [stub('v1')])
+        first = self.discover([src])
+        second = self.discover([src])
+        self.assertEqual((DetailSource.details, first['detail_fetches'], second['rejected_cached']), (1, 1, 1))
+        src.records = [stub('v2')]          # posting changed -> fetched and evaluated again
+        self.discover([src])
+        self.assertEqual(DetailSource.details, 2)
+
     def test_record_errors_are_isolated(self):
         class Boom(FakeSource):
             async def fetch(self, http, ctx):
@@ -712,10 +732,11 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual((link['source_key'], link['source_job_id'], link['kind']), ('lever:jobgether', 'abc', 'aggregator'))
             self.assertEqual(db.execute('SELECT COUNT(*) FROM events').fetchone()[0], 1)
             self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], store.SCHEMA_VERSION)
+            self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='rejected_postings'").fetchone())
             health = db.execute("SELECT last_success_at FROM source_health WHERE source_key='lever:jobgether'").fetchone()
             self.assertIsNotNone(health[0])  # existing board is not treated as a first scan (no digest flood)
             db.close()
-        self.assertEqual(len(list((path.parent / 'backups').glob('legacy-pre-discovery-v1-*.sqlite3'))), 1)
+        self.assertEqual(len(list((path.parent / 'backups').glob('legacy-pre-discovery-v*.sqlite3'))), 1)
 
     def test_rescan_of_migrated_legacy_job_is_not_a_duplicate(self):
         reset_db()

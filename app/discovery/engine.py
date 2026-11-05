@@ -43,31 +43,71 @@ class SourceRun:
         self.error = None
 
 
-async def _process(run, rec, http, ctx, cfg, now_dt, now):
+class SourceState:
+    """Per-source, per-run state: one DB connection, known ids loaded once, batched 'seen' updates.
+    Keeps the per-record cost in memory for the ~98% of postings that are unchanged or irrelevant."""
+
+    def __init__(self, source_key):
+        self.db = core.connect()
+        self.known = {r['source_job_id']: r for r in self.db.execute(
+            'SELECT id, job_id, source_job_id, updated_marker FROM job_sources WHERE source_key=?', (source_key,))}
+        self.rejected = dict(self.db.execute(
+            'SELECT source_job_id, updated_marker FROM rejected_postings WHERE source_key=?', (source_key,)).fetchall())
+        self.seen_links, self.seen_jobs, self.seen_rejected = set(), set(), set()
+        self.source_key = source_key
+
+    def touch(self, link):
+        if link is not None:
+            self.seen_links.add(link['id'])
+            self.seen_jobs.add(link['job_id'])
+
+    def flush(self, now):
+        with self.db:
+            for ids, sql in ((self.seen_links, 'UPDATE job_sources SET last_seen_at=?, missing_count=0, active=1 WHERE id IN ({})'),
+                             (self.seen_jobs, "UPDATE jobs SET last_seen_at=?, availability='active', closed_at=NULL WHERE id IN ({})")):
+                ids = list(ids)
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    self.db.execute(sql.format(','.join('?' * len(chunk))), (now, *chunk))
+            rej = list(self.seen_rejected)
+            for i in range(0, len(rej), 500):
+                chunk = rej[i:i + 500]
+                self.db.execute(f"UPDATE rejected_postings SET last_seen_at=? WHERE source_key=? AND source_job_id IN "
+                                f"({','.join('?' * len(chunk))})", (now, self.source_key, *chunk))
+        self.seen_links.clear(), self.seen_jobs.clear(), self.seen_rejected.clear()
+
+    def close(self):
+        self.db.close()
+
+
+async def _process(run, rec, http, ctx, cfg, now_dt, now, state):
     src, stats, settings = run.source, run.stats, cfg['settings']
-    with core.connect() as db:
-        known = store.find_link(db, rec.source_key, rec.source_job_id)
-        if known and rec.updated_marker and (known['updated_marker'] or '') == rec.updated_marker:
-            store.touch_link(db, known, now)
-            stats['unchanged'] += 1
-            return
+    known = state.known.get(rec.source_job_id)
+    if known and rec.updated_marker and (known['updated_marker'] or '') == rec.updated_marker:
+        state.touch(known)
+        stats['unchanged'] += 1
+        return
+    fetched_detail = False
     if rec.needs_detail:
+        if rec.updated_marker and state.rejected.get(rec.source_job_id) == rec.updated_marker:
+            state.seen_rejected.add(rec.source_job_id)
+            stats['rejected'] += 1
+            stats['rejected_cached'] += 1
+            return
         pre_loc = parse_location(rec.all_location_text(), rec.country, rec.remote_hint)
         if not worth_detail_fetch(rec.title, pre_loc, settings):
             stats['rejected'] += 1
-            if known:
-                with core.connect() as db:
-                    store.touch_link(db, known, now)
+            state.touch(known)
             return
         try:
+            stats['detail_fetches'] += 1
             rec = await src.detail(http, rec)
+            fetched_detail = True
         except SourceError as exc:
             ctx.detail_errors += 1
             stats['errors'] += 1
             run.error = run.error or f'detail: {exc}'
-            if known:
-                with core.connect() as db:
-                    store.touch_link(db, known, now)
+            state.touch(known)
             return
     loc = parse_location(rec.all_location_text(), rec.country, rec.remote_hint)
     age = _age_days(rec.published_at, now_dt)
@@ -78,9 +118,10 @@ async def _process(run, rec, http, ctx, cfg, now_dt, now):
     cls = classify(rec.title, rec.description, loc, settings)
     if not cls.accepted:
         stats['rejected'] += 1
-        if known:
-            with core.connect() as db:
-                store.touch_link(db, known, now)
+        if fetched_detail:  # remember costly rejections so unchanged postings are not re-fetched
+            with state.db:
+                store.remember_rejection(state.db, rec.source_key, rec.source_job_id, rec.updated_marker, '; '.join(cls.reasons))
+        state.touch(known)
         return
     if cls.location_ok and loc.region in ('unknown', 'remote_unspecified'):
         loc.label = 'Netherlands (per description)' if loc.region == 'unknown' else 'Remote (Europe per description)'
@@ -96,8 +137,8 @@ async def _process(run, rec, http, ctx, cfg, now_dt, now):
          'language_req': language_requirement(rec.title, rec.description), 'canonical_url': canonical_url(rec.url),
          'canonical_apply_url': canonical_url(rec.apply_url), 'ats_keys': keys,
          'priority': store.PRIORITY.get(rec.kind, 1), 'listing': 'complete' if src.complete_listing else 'search'}
-    with core.connect() as db:
-        outcome, job_id, how = store.upsert(db, rec, n, now)
+    with state.db:
+        outcome, job_id, how = store.upsert(state.db, rec, n, now)
     stats['accepted'] += 1
     if outcome == 'new':
         stats['new'] += 1
@@ -141,11 +182,12 @@ async def _run_source(source, http, cfg, run_started, force):
     ctx = _s.FetchContext()
     started = time.monotonic()
     attempted = core.now_iso()
+    state = SourceState(source.key)
     try:
         async for rec in source.fetch(http, ctx):
             run.stats['fetched'] += 1
             try:
-                await _process(run, rec, http, ctx, cfg, now_dt, attempted)
+                await _process(run, rec, http, ctx, cfg, now_dt, attempted, state)
             except SourceRateLimited:
                 raise
             except Exception as exc:  # one bad record never stops the source
@@ -160,6 +202,10 @@ async def _run_source(source, http, cfg, run_started, force):
     except Exception as exc:
         run.status, run.error = FAILED, f'{type(exc).__name__}: {exc}'
         log.exception('Discovery: source %s crashed', source.key)
+    try:
+        state.flush(attempted)  # postings seen this run (needed before closure detection)
+    finally:
+        state.close()
     closed = 0
     if source.complete_listing and run.status == OK and not ctx.truncated:
         with core.connect() as db:
@@ -211,6 +257,7 @@ async def run_discovery(on_new_job=None, *, sources=None, cfg=None, http=None, n
     cfg = cfg or dconfig.load()
     core.init_db()
     config_errors = []
+    config_built = sources is None
     if sources is None:
         sources, config_errors = dconfig.build_sources(cfg)
         for err in config_errors:
@@ -234,9 +281,14 @@ async def run_discovery(on_new_job=None, *, sources=None, cfg=None, http=None, n
             await http.aclose()
     with core.connect() as db:
         stale = store.mark_stale(db, settings['stale_after_days'])
+        store.prune_rejections(db)
+        if config_built:  # sources removed from discovery.yaml: keep their history, mark them as removed
+            keys = [s.key for s in sources]
+            db.execute(f"UPDATE source_health SET status='removed', enabled=0 WHERE source_key NOT IN ({','.join('?' * len(keys))})", keys)
     totals = Counter()
     for r in runs:
-        totals.update({k: r.stats[k] for k in ('fetched', 'accepted', 'new', 'duplicates', 'rejected', 'errors', 'closed', 'unchanged')})
+        totals.update({k: r.stats[k] for k in ('fetched', 'accepted', 'new', 'duplicates', 'rejected', 'errors', 'closed',
+                                               'unchanged', 'detail_fetches', 'rejected_cached')})
     new_jobs = [j for r in runs for j in r.new_jobs]
     for job in sorted(new_jobs, key=lambda j: (TIER_RANK.get(j['tier'], 9), -j['score'])):
         if on_new_job and job['tier'] in ('primary', 'secondary'):
@@ -249,6 +301,8 @@ async def run_discovery(on_new_job=None, *, sources=None, cfg=None, http=None, n
     summary = {'checked': totals['fetched'], 'new': totals['new'], 'duplicates': totals['duplicates'],
                'accepted': totals['accepted'], 'rejected': totals['rejected'], 'unchanged': totals['unchanged'],
                'closed': totals['closed'], 'stale': stale, 'errors': totals['errors'], 'notifications': notified,
+               'detail_fetches': totals['detail_fetches'], 'rejected_cached': totals['rejected_cached'],
+               'http_requests': http.requests,
                'sources': dict(statuses), 'config_errors': config_errors}
     with core.connect() as db:
         db.execute('INSERT INTO discovery_runs (started_at, finished_at, sources, fetched, new_unique, duplicates, errors, '

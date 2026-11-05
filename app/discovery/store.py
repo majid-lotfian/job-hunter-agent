@@ -14,7 +14,7 @@ from .models import AGGREGATOR
 from .normalize import ats_key, canonical_url, employer_key, parse_location, seniority, seniority_label, title_key
 from .relevance import role_tier
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 JOB_COLUMNS = {
     'employer': 'TEXT', 'employer_key': 'TEXT', 'title_key': 'TEXT', 'seniority': 'TEXT', 'seniority_sig': 'TEXT',
     'location_label': 'TEXT', 'location_region': 'TEXT', 'city': 'TEXT', 'country': 'TEXT', 'remote_type': 'TEXT',
@@ -66,8 +66,33 @@ def _backup(reason):
     return target
 
 
+# v2: remember postings rejected after a detail fetch, so unchanged ones are not re-fetched every scan.
+DDL_V2 = ['''CREATE TABLE IF NOT EXISTS rejected_postings (
+                source_key TEXT NOT NULL, source_job_id TEXT NOT NULL, updated_marker TEXT, reason TEXT,
+                last_seen_at TEXT NOT NULL, PRIMARY KEY (source_key, source_job_id))''']
+
+
+def _migrate_v1(db):
+    existing = {r['name'] for r in db.execute('PRAGMA table_info(jobs)')}
+    for column, ddl in JOB_COLUMNS.items():
+        if column not in existing:
+            db.execute(f'ALTER TABLE jobs ADD COLUMN {column} {ddl}')
+    for statement in DDL:  # executescript() would COMMIT implicitly and break atomicity
+        db.execute(statement)
+    _backfill_links(db)
+
+
+def _migrate_v2(db):
+    for statement in DDL_V2:
+        db.execute(statement)
+
+
+MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2}
+
+
 def migrate():
-    """Bring the database to SCHEMA_VERSION. Safe to call on every start (no-op when current)."""
+    """Bring the database to SCHEMA_VERSION, one versioned step at a time, in a single transaction.
+    Safe to call on every start (no-op when current)."""
     with connect() as db:
         version = db.execute('PRAGMA user_version').fetchone()[0]
         has_jobs = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone()
@@ -77,19 +102,15 @@ def migrate():
         with connect() as db:
             populated = db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0]
         if populated:
-            backup = _backup('pre-discovery-v1')
+            backup = _backup(f'pre-discovery-v{version + 1}')
             log.info('Backed up database to %s before discovery schema migration', backup)
     db = sqlite3.connect(DB, timeout=30, isolation_level=None)
     db.row_factory = sqlite3.Row
     try:
         db.execute('BEGIN IMMEDIATE')
-        existing = {r['name'] for r in db.execute('PRAGMA table_info(jobs)')}
-        for column, ddl in JOB_COLUMNS.items():
-            if column not in existing:
-                db.execute(f'ALTER TABLE jobs ADD COLUMN {column} {ddl}')
-        for statement in DDL:  # executescript() would COMMIT implicitly and break atomicity
-            db.execute(statement)
-        _backfill_links(db)
+        version = db.execute('PRAGMA user_version').fetchone()[0]  # another process may have migrated meanwhile
+        for step in range(version + 1, SCHEMA_VERSION + 1):
+            MIGRATIONS[step](db)
         db.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
         db.execute('COMMIT')
     except Exception:
@@ -272,6 +293,31 @@ def mark_stale(db, stale_days=21, now=None):
     return db.execute("""UPDATE jobs SET availability='stale' WHERE availability='active' AND last_seen_at < ?
                          AND NOT EXISTS (SELECT 1 FROM job_sources s WHERE s.job_id=jobs.id AND s.listing='complete' AND s.active=1)
                          AND EXISTS (SELECT 1 FROM job_sources s WHERE s.job_id=jobs.id)""", (cutoff,)).rowcount
+
+
+# --------------------------------------------------------------------------- rejected-posting memory
+
+def rejected_unchanged(db, source_key, source_job_id, marker):
+    if not marker:
+        return False
+    row = db.execute('SELECT updated_marker FROM rejected_postings WHERE source_key=? AND source_job_id=?',
+                     (source_key, source_job_id)).fetchone()
+    if row and row['updated_marker'] == marker:
+        db.execute('UPDATE rejected_postings SET last_seen_at=? WHERE source_key=? AND source_job_id=?',
+                   (now_iso(), source_key, source_job_id))
+        return True
+    return False
+
+
+def remember_rejection(db, source_key, source_job_id, marker, reason):
+    if marker:
+        db.execute('INSERT OR REPLACE INTO rejected_postings VALUES (?,?,?,?,?)',
+                   (source_key, source_job_id, marker, (reason or '')[:200], now_iso()))
+
+
+def prune_rejections(db, days=45):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    return db.execute('DELETE FROM rejected_postings WHERE last_seen_at < ?', (cutoff,)).rowcount
 
 
 # --------------------------------------------------------------------------- source health

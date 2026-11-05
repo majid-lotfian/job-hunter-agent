@@ -11,7 +11,8 @@ DEFAULT_SETTINGS = {
     'close_after_missed_scans': 2, 'stale_after_days': 21, 'aggregator_max_age_days': 30,
     'accept_nl_outside_randstad': True, 'allow_relocation': False, 'default_host_interval_seconds': 1.0,
     'host_intervals': {'apply.workable.com': 6, 'myworkdayjobs.com': 3, 'remotive.com': 5, 'remoteok.com': 5,
-                       'api.smartrecruiters.com': 1, 'jobs.booking.com': 5},
+                       'boards-api.greenhouse.io': 0.5, 'api.lever.co': 0.5, 'api.ashbyhq.com': 0.5,
+                       'api.smartrecruiters.com': 0.5, 'jobs.booking.com': 5},
 }
 DEFAULT_NOTIFICATIONS = {'min_score': None, 'max_individual_per_run': 10, 'digest': True}
 

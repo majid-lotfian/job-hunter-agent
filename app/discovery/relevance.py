@@ -74,8 +74,9 @@ class Classification:
     location_ok: bool = False
 
 
-def ai_signal_count(text):
-    return sum(1 for p in AI_SIGNALS if p.search(text or ''))
+def ai_signal_count(text, limit=8000):
+    text = (text or '')[:limit]
+    return sum(1 for p in AI_SIGNALS if p.search(text))
 
 
 def role_tier(title, description=''):
@@ -85,8 +86,12 @@ def role_tier(title, description=''):
         return 'none', f'excluded title term: {EXCLUDE_TITLE.search(title).group(0)}'
     if 'intern' in seniority(title) or 'junior' in seniority(title):
         return 'none', 'excluded seniority (intern/junior)'
-    signals = ai_signal_count(description)
-    hands_on = bool(HANDS_ON.search(description or ''))
+    cache = {}
+
+    def signals_():  # only computed for context-dependent titles (descriptions can be long)
+        if 'n' not in cache:
+            cache['n'] = ai_signal_count(description)
+        return cache['n']
     for p in SECONDARY:
         if p.search(title):
             return 'secondary', f'title matches {p.pattern[:40]}'
@@ -103,15 +108,15 @@ def role_tier(title, description=''):
         # title AND real AI/ML content in the description (so 'AI Product Manager' does not qualify).
         if not p.search(title) or not ENGINEERING_TITLE.search(title):
             continue
-        if 'consultant' in p.pattern and not hands_on:
+        if 'consultant' in p.pattern and not HANDS_ON.search((description or '')[:8000]):
             continue
-        if signals >= 2:
-            return 'primary', f'title + AI context ({signals} signals)'
+        if signals_() >= 2:
+            return 'primary', f'title + AI context ({signals_()} signals)'
     for p in CONTEXTUAL_SECONDARY:
-        if p.search(title) and signals >= 2:
-            return 'secondary', f'title + ML context ({signals} signals)'
-    if ENGINEERING_TITLE.search(title) and signals >= 5:
-        return 'possible', f'unusual title, strong AI/ML description ({signals} signals)'
+        if p.search(title) and signals_() >= 2:
+            return 'secondary', f'title + ML context ({signals_()} signals)'
+    if ENGINEERING_TITLE.search(title) and signals_() >= 5:
+        return 'possible', f'unusual title, strong AI/ML description ({signals_()} signals)'
     return 'none', 'title/description not in target roles'
 
 
@@ -137,10 +142,11 @@ def location_eligible(loc, description='', config=None):
 
 
 def classify(title, description, loc, config=None):
-    tier, reason = role_tier(title, description)
     ok_loc, loc_reason = location_eligible(loc, description, config)
-    return Classification(tier=tier, accepted=tier != 'none' and ok_loc, reasons=[reason, loc_reason],
-                          ai_signals=ai_signal_count(description), location_ok=ok_loc)
+    if not ok_loc:  # cheap check first: most postings are outside the Netherlands
+        return Classification(tier='none', accepted=False, reasons=['not evaluated', loc_reason], location_ok=False)
+    tier, reason = role_tier(title, description)
+    return Classification(tier=tier, accepted=tier != 'none', reasons=[reason, loc_reason], location_ok=True)
 
 
 def worth_detail_fetch(title, loc, config=None):

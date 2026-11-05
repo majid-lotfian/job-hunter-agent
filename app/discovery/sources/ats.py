@@ -308,6 +308,7 @@ class WorkdaySource(Source):
         self.enabled = bool(options.get('enabled', False))  # disabled unless explicitly enabled
         self.tenant, self.wd, self.site = options['tenant'], options.get('wd', 'wd3'), options['site']
         self.queries = list(options.get('queries') or ['machine learning', 'AI engineer', 'data scientist', 'LLM'])
+        self.max_pages = int(options.get('max_pages', 3))  # query-based: keep shallow (3 x 20 per query)
         self.base = f'https://{self.tenant}.{self.wd}.myworkdayjobs.com'
 
     async def fetch(self, http, ctx):

@@ -102,11 +102,15 @@ US_STATE = re.compile(r',\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|
                       r'NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC)\b')
 
 
+_PLACE_RE = {}
+
+
 def _find_place(text, places):
-    for place in places:
-        if re.search(r'(?<![\w-])' + re.escape(place) + r'(?![\w-])', text):
-            return place
-    return None
+    key = id(places)
+    if key not in _PLACE_RE:  # one precompiled alternation per list, longest names first
+        _PLACE_RE[key] = re.compile(r'(?<![\w-])(' + '|'.join(re.escape(p) for p in sorted(places, key=len, reverse=True)) + r')(?![\w-])')
+    match = _PLACE_RE[key].search(text)
+    return match.group(1) if match else None
 
 
 @dataclass
