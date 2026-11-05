@@ -72,9 +72,10 @@ class KeywordPriorityTests(unittest.TestCase):
         self.assertLessEqual(five, 100)
         self.assertGreaterEqual(five, 90)
 
-    def test_unusual_but_ai_heavy_role_qualifies(self):
+    def test_unusual_title_needs_the_keyword_in_the_title(self):
         desc = 'Build RAG pipelines in Python with PyTorch, LLM evaluation, embeddings, transformers, vector search and MLOps.'
-        self.assertGreaterEqual(score('Software Engineer', desc)[0], 70)
+        self.assertLess(score('Software Engineer', desc)[0], 70)                       # boilerplate-prone: no floor
+        self.assertGreaterEqual(score('Software Engineer, LLM Agents', desc)[0], 70)  # keyword in the title
 
     def test_not_applied_to_unsuitable_roles(self):
         self.assertLess(score('Data Engineer', 'Python and Airflow. Experience with LLMs is a plus.')[0], 70)  # not an AI role

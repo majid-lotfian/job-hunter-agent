@@ -484,7 +484,7 @@ class DiscoveryIntegrationTests(Base):
     def test_engine_stores_matched_ai_keywords(self):
         from app.discovery import engine
         from tests.test_discovery import FakeSource, make_http, rec, test_cfg
-        src = FakeSource('greenhouse:acme', [rec(job_id='kw1', title='Software Engineer',
+        src = FakeSource('greenhouse:acme', [rec(job_id='kw1', title='Software Engineer, LLM Platform',
                                                  description='We build RAG pipelines and LLM agents in Python with PyTorch, '
                                                              'embeddings, transformers, vector search, MLOps and evaluation. ' * 3)])
         run(engine.run_discovery(sources=[src], cfg=test_cfg(), http=make_http(lambda r: httpx.Response(500)),
@@ -493,6 +493,22 @@ class DiscoveryIntegrationTests(Base):
             row = db.execute("SELECT score, ai_keywords FROM jobs WHERE source_id='kw1'").fetchone()
         self.assertEqual(set(row['ai_keywords'].split(',')), {'RAG', 'LLM', 'agent'})
         self.assertGreaterEqual(row['score'], 70)
+
+    def test_rescore_updates_only_score_and_keywords(self):
+        from app import rescore
+        job = self.add_job(score=20, title='Machine Learning Engineer')
+        with core.connect() as db:
+            db.execute("UPDATE jobs SET status='needs_revision', description='Fine-tune LLMs in Python.', location_label='Amsterdam, Netherlands' WHERE id=?", (job,))
+        with mock.patch.object(rescore, 'config', lambda f: {'matching': {'titles_any': ['Machine Learning Engineer'], 'keywords_any': ['Python'],
+                                                                          'locations_any': ['Netherlands'], 'excluded_terms': [], 'max_age_days': 30}}):
+            dry = rescore.rescore(dry_run=True)
+            self.assertEqual(self.job(job)['score'], 20)                    # dry run changes nothing
+            result = rescore.rescore()
+        row = self.job(job)
+        self.assertEqual((dry['changed'], result['changed']), (1, 1))
+        self.assertGreaterEqual(row['score'], 70)
+        self.assertEqual(set(row['ai_keywords'].split(',')), {'LLM', 'fine-tuning'})
+        self.assertEqual(row['status'], 'needs_revision')                   # status untouched
 
     def test_v4_migration_marks_existing_jobs_announced(self):
         from app.discovery import store

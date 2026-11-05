@@ -214,7 +214,10 @@ def score_breakdown(job, settings):
     ai_keywords = strong_ai_keywords(f'{title}\n{description[:20000]}')
     tier, _ = role_tier(title, description)
     floor = 0
-    if ai_keywords and tier != 'none' and language != 'dutch_required':
+    # 'possible' = unusual title with an AI-heavy description: require the keyword in the title itself, because
+    # company boilerplate ("we build AI agents") would otherwise lift generic engineering roles.
+    suitable = tier in ('primary', 'secondary') or (tier == 'possible' and strong_ai_keywords(title))
+    if ai_keywords and suitable and language != 'dutch_required':
         floor = min(KEYWORD_FLOOR_CAP, KEYWORD_FLOOR + KEYWORD_STEP * (len(ai_keywords) - 1))
     score = max(base, floor)
     return score, {'title': title_pts, 'title_kind': title_kind, 'keywords': kw_hits, 'skills': skills,
