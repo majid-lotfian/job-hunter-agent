@@ -127,6 +127,40 @@ SCORE_WEIGHTS = {'title_primary': 40, 'title_secondary': 30, 'title_keyword_only
                  'skill': 4, 'requirements_cap': 45, 'seniority': 5, 'location': 5, 'dutch_required': -10}
 
 
+# Strong AI expressions: one family is enough to lift an otherwise suitable AI/ML role to >= 70.
+STRONG_AI_KEYWORDS = {
+    'RAG': [r'\brag\b', r'\bretrieval[- ]augmented(?:[- ]generation)?\b'],
+    'agent': [r'\bai[- ]agents?\b', r'\bagent[- ]based\b', r'\bmulti[- ]agents?\b', r'\bautonomous agents?\b', r'\bagents?\b'],
+    'agentic': [r'\bagentic\b'],
+    'LLM': [r'\bllm[- ]based\b', r'\blarge language models?\b', r'\bllms?\b'],
+    'fine-tuning': [r'\bfine[- ]?tun(?:e|es|ed|ing)\b'],
+}
+_STRONG_RE = {fam: [re.compile(p, re.I) for p in pats] for fam, pats in STRONG_AI_KEYWORDS.items()}
+# Contexts where a keyword does not mean AI (removed before matching).
+_KEYWORD_FALSE_POSITIVES = re.compile(
+    r'\b(?:real[- ]estate|travel|insurance|customer[- ]service|customer|support|sales|call[- ]cent(?:er|re)|booking|'
+    r'leasing|letting|user|change|free|secret|shipping|customs|transfer|patent|border|ticket|service)\s+agents?\b|'
+    r'\brag\s+(?:status|rating|report(?:ing)?)\b|red[/ -]amber[/ -]green|\bll\.\s?m\.?|\bllm\s+(?:degree|in\s+law)\b|'
+    r'master\s+of\s+laws', re.I)
+KEYWORD_FLOOR, KEYWORD_STEP, KEYWORD_FLOOR_CAP = 70, 5, 90
+
+
+def strong_ai_keywords(text):
+    """{family: [matched expressions]} for the strong AI keyword families, word-boundary and case-insensitive."""
+    clean = _KEYWORD_FALSE_POSITIVES.sub(' ', text or '')
+    found = {}
+    for fam, patterns in _STRONG_RE.items():
+        hits = []
+        for p in patterns:
+            for m in p.finditer(clean):
+                expr = re.sub(r'\s+', ' ', m.group(0).lower())
+                if expr not in hits:
+                    hits.append(expr)
+        if hits:
+            found[fam] = hits[:4]
+    return found
+
+
 def _title_points(title, matching):
     t = title.lower()
     if any(term.lower() in t for term in matching.get('titles_any', [])) or any(re.search(p, t) for p in PRIMARY_TITLES):
@@ -173,9 +207,19 @@ def score_breakdown(job, settings):
     location_pts = w['location'] if region in ('randstad', 'nl_unspecified', 'remote_nl', 'nl_other') else 0
     language = job.get('language_req') or language_requirement(title, description)
     language_pts = w['dutch_required'] if language == 'dutch_required' else 0
-    score = max(0, min(100, title_pts + requirements + seniority_pts + location_pts + language_pts))
+    base = max(0, min(100, title_pts + requirements + seniority_pts + location_pts + language_pts))
+    # Strong AI keyword priority: only for roles that are otherwise suitable (relevant AI/ML/LLM technical role,
+    # all gates passed, no Dutch-language requirement). One family -> >= 70; each extra family +5 (max 90).
+    from .discovery.relevance import role_tier
+    ai_keywords = strong_ai_keywords(f'{title}\n{description[:20000]}')
+    tier, _ = role_tier(title, description)
+    floor = 0
+    if ai_keywords and tier != 'none' and language != 'dutch_required':
+        floor = min(KEYWORD_FLOOR_CAP, KEYWORD_FLOOR + KEYWORD_STEP * (len(ai_keywords) - 1))
+    score = max(base, floor)
     return score, {'title': title_pts, 'title_kind': title_kind, 'keywords': kw_hits, 'skills': skills,
-                   'requirements': requirements, 'seniority': seniority_pts, 'location': location_pts, 'language': language_pts}
+                   'requirements': requirements, 'seniority': seniority_pts, 'location': location_pts, 'language': language_pts,
+                   'base': base, 'ai_keywords': ai_keywords, 'keyword_floor': floor, 'role_tier': tier}
 
 
 def score_job(job, settings):

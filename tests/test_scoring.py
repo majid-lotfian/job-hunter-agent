@@ -35,7 +35,8 @@ class ScoringTests(unittest.TestCase):
                 self.assertGreaterEqual(score(f'Senior {title}'), 70)
 
     def test_title_alone_is_not_enough(self):
-        for title in TARGET_TITLES:
+        # Titles containing a strong AI keyword (LLM, agentic, ...) are lifted to >= 70 by design (keyword priority).
+        for title in [t for t in TARGET_TITLES if not core.strong_ai_keywords(t)]:
             with self.subTest(title=title):
                 self.assertLess(score(f'Senior {title}', WEAK), 70)
 

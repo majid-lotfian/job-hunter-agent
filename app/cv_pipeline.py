@@ -29,6 +29,7 @@ CLI (on the VM, project directory):
 """
 import argparse
 import asyncio
+import time
 import html
 import json
 import os
@@ -67,14 +68,18 @@ def settings():
         'min_interval': max(0, _env_int('LLM_MIN_INTERVAL_SECONDS', 15)),
         'poll': max(5, _env_int('CV_WORKER_POLL_SECONDS', 60)),
         'config_pause': max(30, _env_int('CV_CONFIG_ERROR_PAUSE_SECONDS', 1800)),
-        # Automatic CVs per local calendar day (manual/forced CVs are not counted). Negative = unlimited.
-        'daily_limit': _env_int('CV_DAILY_LIMIT', 5),
+        # Optional safety control: automatic CVs per local calendar day (manual/approved CVs are not counted).
+        # Default: no fixed limit (-1). Cost protection comes from the daily LLM request budget below.
+        'daily_limit': _env_int('CV_DAILY_LIMIT', -1),
+        'concurrency': max(1, _env_int('CV_WORKER_CONCURRENCY', 1)),
+        'llm_daily_budget': _env_int('LLM_MAX_REQUESTS_PER_DAY', 250),   # hard stop for Gemini calls; -1 = unlimited
+        'rate_limit_cooldown': max(10, _env_int('LLM_RATE_LIMIT_COOLDOWN_SECONDS', 120)),
         'timezone': os.getenv('CV_TIMEZONE', 'Europe/Amsterdam').strip() or 'Europe/Amsterdam',
     }
 
 
-AUTO_REASONS = ('new', 'legacy')          # queued automatically (count against CV_DAILY_LIMIT)
-MANUAL_REASONS = ('manual', 'regenerate')  # dashboard button / CLI: never consume the automatic quota
+AUTO_REASONS = ('new', 'legacy')                      # queued automatically (count against CV_DAILY_LIMIT)
+MANUAL_REASONS = ('approved', 'manual', 'regenerate')  # approved by you / dashboard / CLI: never count, served first
 
 
 def local_day(cfg=None):
@@ -88,6 +93,35 @@ def local_day(cfg=None):
     return datetime.now(tz).date().isoformat()
 
 
+def llm_requests_today(cfg=None):
+    with connect() as db:
+        row = db.execute('SELECT requests FROM llm_usage WHERE day=?', (local_day(cfg),)).fetchone()
+    return row['requests'] if row else 0
+
+
+def record_llm_request(cfg=None):
+    with connect() as db:
+        db.execute('INSERT INTO llm_usage (day, requests) VALUES (?, 1) ON CONFLICT(day) DO UPDATE SET requests=requests+1',
+                   (local_day(cfg),))
+
+
+def llm_budget_left(cfg=None):
+    cfg = cfg or settings()
+    budget = cfg['llm_daily_budget']
+    return budget < 0 or llm_requests_today(cfg) < budget
+
+
+class BudgetExhausted(Exception):
+    """The daily LLM request budget is used up; the job waits (not the job's fault)."""
+
+
+_cooldown = {'until': 0.0, 'reason': None}   # process-wide pause after a provider rate limit
+
+
+def rate_limited_until():
+    return _cooldown['until']
+
+
 def quota_status(cfg=None):
     cfg = cfg or settings()
     day = local_day(cfg)
@@ -97,7 +131,10 @@ def quota_status(cfg=None):
                              f"({','.join('?' * len(AUTO_REASONS))}) AND quota_day IS NULL", AUTO_REASONS).fetchone()[0]
     limit = cfg['daily_limit']
     return {'day': day, 'timezone': cfg['timezone'], 'daily_limit': limit, 'used_today': used,
-            'remaining_today': None if limit < 0 else max(0, limit - used), 'queued_automatic': waiting}
+            'remaining_today': None if limit < 0 else max(0, limit - used), 'queued_automatic': waiting,
+            'llm_requests_today': llm_requests_today(cfg), 'llm_daily_budget': cfg['llm_daily_budget'],
+            'concurrency': cfg['concurrency'],
+            'rate_limited_for_seconds': max(0, int(_cooldown['until'] - time.monotonic()))}
 
 
 class PipelineError(Exception):
@@ -386,6 +423,9 @@ async def generate(job, provider, max_rounds=2):
     redactor = Redactor(master_html)
     feedback, malformed = None, None
     for _ in range(max_rounds):
+        if not llm_budget_left():
+            raise BudgetExhausted('daily LLM request budget (LLM_MAX_REQUESTS_PER_DAY) reached')
+        record_llm_request()
         try:
             reply = await provider.generate_json(SYSTEM_PROMPT, build_prompt(redactor.redacted_body, job, feedback),
                                                  schema=CV_SCHEMA)
@@ -441,6 +481,11 @@ async def process(job_id, provider, cfg=None):
         return 'ready'  # a tailored CV appeared meanwhile (e.g. Claude Code); never overwrite it
     try:
         document, warnings, notes = await generate(job, provider)
+    except BudgetExhausted as exc:
+        refund = row['attempts'] <= 1 and row['quota_day'] == local_day(cfg)
+        set_cv_job(job_id, 'pending', attempts=max(0, row['attempts'] - 1), last_error=str(exc),
+                   **({'quota_day': None} if refund else {}))
+        return 'pending'
     except (llm.ConfigurationLLMError, PipelineError):
         # Not the job's fault: give back the attempt and (if this claim consumed it) the daily quota slot.
         refund = row['attempts'] <= 1 and row['quota_day'] == local_day(cfg)
@@ -451,6 +496,10 @@ async def process(job_id, provider, cfg=None):
         if row['attempts'] >= cfg['max_attempts']:
             return await _failed(job, f'Gave up after {row["attempts"]} attempts: {exc}')
         delay = backoff_seconds(row['attempts'], cfg, exc.retry_after)
+        if '429' in str(exc) or 'RESOURCE_EXHAUSTED' in str(exc):  # provider rate limit: pause ALL workers
+            pause = max(cfg['rate_limit_cooldown'], exc.retry_after or 0)
+            _cooldown.update(until=time.monotonic() + pause, reason=str(exc)[:200])
+            log.warning('Gemini rate limit: pausing CV generation for %ss', pause)
         retry_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
         set_cv_job(job_id, 'pending', last_error=f'Temporary: {exc}', next_attempt_at=retry_at)
         log.warning('CV for job %s: temporary LLM error, retry in %ss (%s)', job_id, delay, exc)
@@ -470,12 +519,22 @@ async def process(job_id, provider, cfg=None):
                next_attempt_at=None, warnings='\n'.join(warnings) or None, notes=json.dumps(notes),
                completed_at=now_iso(), notified_at=None)  # announced in the next CV digest
     log.info('CV for job %s: %s (%d warning(s))', job_id, status, len(warnings))
+    _cv_finished(job_id, status)
     return status
+
+
+def _cv_finished(job_id, status):
+    from . import workflow  # lazy: workflow imports this module
+    try:
+        workflow.on_cv_finished(job_id, status)
+    except Exception:
+        log.exception('Approval workflow hook failed for job %s', job_id)
 
 
 async def _failed(job, message):
     set_cv_job(job['id'], 'failed', last_error=message[:1000], next_attempt_at=None, completed_at=now_iso(), notified_at=None)
     log.error('CV for job %s failed: %s', job['id'], message)
+    _cv_finished(job['id'], 'failed')
     return 'failed'
 
 
@@ -488,14 +547,16 @@ async def send_cv_digest(cfg=None):
     restart never repeats a digest and a failed send is retried next time. Returns the number announced."""
     cfg = cfg or settings()
     with connect() as db:
+        # Ready / needs-review CVs are announced individually with Approve & Apply buttons (app.workflow);
+        # this digest only reports failures.
+        db.execute("UPDATE cv_jobs SET notified_at=? WHERE status IN ('ready','needs_review') AND notified_at IS NULL", (now_iso(),))
         rows = db.execute("""SELECT c.job_id, c.status, c.warnings, c.last_error, c.notes, j.title, j.company, j.employer, j.score
                              FROM cv_jobs c JOIN jobs j ON j.id=c.job_id
-                             WHERE c.status IN ('ready','needs_review','failed') AND c.notified_at IS NULL
-                             ORDER BY CASE c.status WHEN 'failed' THEN 1 ELSE 0 END, j.score DESC, c.job_id""").fetchall()
+                             WHERE c.status='failed' AND c.notified_at IS NULL ORDER BY j.score DESC, c.job_id""").fetchall()
     if not rows:
         return 0
     ok = [r for r in rows if r['status'] != 'failed']
-    lines = [f'CV digest: {len(ok)} tailored CV(s) ready for review' + (f', {len(rows) - len(ok)} failed' if len(ok) < len(rows) else '')]
+    lines = [f'CV generation failed for {len(rows)} job(s)' if not ok else f'CV digest: {len(ok)} ready, {len(rows) - len(ok)} failed']
     for r in rows:
         head = f"• {r['score']}/100 {r['title']} — {r['employer'] or r['company']}"
         if r['status'] == 'failed':
@@ -576,6 +637,8 @@ def claim_next(cfg=None):
     Automatic jobs are only claimed while today's CV_DAILY_LIMIT has room; the first claim of an automatic
     job records the local day (one quota slot per job, never again for its retries)."""
     cfg = cfg or settings()
+    if time.monotonic() < _cooldown['until'] or not llm_budget_left(cfg):
+        return None  # rate-limited or daily LLM budget used up: everything waits, nothing is lost
     now, day, limit = now_iso(), local_day(cfg), cfg['daily_limit']
     manual = ','.join(f"'{r}'" for r in MANUAL_REASONS)
     with connect() as db:
@@ -585,7 +648,8 @@ def claim_next(cfg=None):
         row = db.execute(f"""SELECT c.job_id, c.reason, c.quota_day FROM cv_jobs c JOIN jobs j ON j.id=c.job_id
                              WHERE c.status='pending' AND (c.next_attempt_at IS NULL OR c.next_attempt_at<=?)
                                AND (c.reason IN ({manual}) OR c.quota_day IS NOT NULL OR ?)
-                             ORDER BY CASE WHEN c.reason IN ({manual}) THEN 0 ELSE 1 END, j.score DESC,
+                             ORDER BY CASE c.reason WHEN 'approved' THEN 0 WHEN 'manual' THEN 1 WHEN 'regenerate' THEN 1 ELSE 2 END,
+                                      j.score DESC,
                                       COALESCE(j.published_at, j.discovered_at) DESC, c.job_id LIMIT 1""",
                          (now, auto_ok)).fetchone()
         if not row:
@@ -624,6 +688,7 @@ class CVWorker:
         self.paused_reason = None
         self._alerted_reason = None
         self._last_request = 0.0
+        self._pace_lock = asyncio.Lock()
 
     async def _alert_pause(self, reason):
         """Critical-failure alert: once per distinct reason (not repeated every poll)."""
@@ -656,13 +721,14 @@ class CVWorker:
             if quota_status(cfg)['queued_automatic'] or claim_next_exists():
                 await self._alert_pause(self.paused_reason)
             return False
-        wait = self._last_request + cfg['min_interval'] - asyncio.get_running_loop().time()
-        if wait > 0:
-            await asyncio.sleep(wait)
-        job_id = claim_next(cfg)
-        if job_id is None:
-            return False
-        self._last_request = asyncio.get_running_loop().time()
+        async with self._pace_lock:  # concurrency never breaks the minimum interval between LLM jobs
+            wait = self._last_request + cfg['min_interval'] - asyncio.get_running_loop().time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            job_id = claim_next(cfg)
+            if job_id is None:
+                return False
+            self._last_request = asyncio.get_running_loop().time()
         try:
             await process(job_id, provider, cfg)
             self.paused_reason = None
@@ -680,15 +746,24 @@ class CVWorker:
         except asyncio.TimeoutError:
             pass
 
+    async def _drain(self):
+        while await self.run_once():
+            pass
+
+    async def run_batch(self):
+        """Process all due jobs with CV_WORKER_CONCURRENCY parallel slots, then notify once."""
+        backfill()
+        await asyncio.gather(*(self._drain() for _ in range(settings()['concurrency'])))
+        await send_cv_digest()  # failures only; ready CVs get individual Approve & Apply messages
+        from . import workflow
+        await workflow.send_pending_actions()
+
     async def run(self):
         init_db()
         recover_stale()
         while True:
             try:
-                backfill()
-                while await self.run_once():
-                    pass
-                await send_cv_digest()  # one message per batch, never one per CV
+                await self.run_batch()
             except asyncio.CancelledError:
                 raise
             except Exception:

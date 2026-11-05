@@ -10,7 +10,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel
 
-from . import auth, cv_pipeline
+from . import auth, cv_pipeline, workflow
+from .applications import ApplicationWorker
 from .core import connect, init_db, discover, get_job, cv_path, transition, log
 
 auth.install_log_redaction()
@@ -18,6 +19,7 @@ auth.install_log_redaction()
 scheduler = AsyncIOScheduler()
 run_lock = asyncio.Lock()
 cv_worker = cv_pipeline.CVWorker()
+application_worker = ApplicationWorker()
 
 
 async def scan():
@@ -25,7 +27,12 @@ async def scan():
         log.info('Scan already running; skipping')
         return {'skipped': True}
     async with run_lock:
-        return await discover(on_new_job=cv_worker.on_new_job)
+        summary = await discover(on_new_job=cv_worker.on_new_job)
+        try:  # individual actionable messages for jobs waiting for a decision (capped per batch)
+            await workflow.send_pending_actions()
+        except Exception:
+            log.exception('Sending approval messages failed')
+        return summary
 
 
 async def telegram_loop():
@@ -44,16 +51,16 @@ async def telegram_loop():
                     cb = update.get('callback_query') or {}
                     if not cb:
                         continue
-                    action, _, raw_id = (cb.get('data') or '').partition(':')
-                    sender_chat = str((cb.get('message') or {}).get('chat', {}).get('id', ''))
-                    answer = 'Unauthorized'
-                    if sender_chat == str(chat) and action in ('approve', 'reject') and raw_id.isdigit():
-                        try:
-                            transition(int(raw_id), 'approved' if action == 'approve' else 'rejected', 'Telegram action')
-                            answer = 'Draft approved (not submitted)' if action == 'approve' else 'Rejected'
-                        except ValueError as exc:
-                            answer = str(exc)
+                    message = cb.get('message') or {}
+                    allowed_users = {x.strip() for x in os.getenv('TELEGRAM_ALLOWED_USER_IDS', '').split(',') if x.strip()}
+                    answer, remove = workflow.handle_telegram_callback(
+                        cb.get('data'), chat_id=(message.get('chat') or {}).get('id', ''), user_id=(cb.get('from') or {}).get('id', ''),
+                        allowed_chat=chat, allowed_users=allowed_users)
                     await client.post(f'https://api.telegram.org/bot{token}/answerCallbackQuery', json={'callback_query_id': cb['id'], 'text': answer[:190], 'show_alert': True})
+                    if remove and message.get('message_id'):  # no second press on a decided/stale message
+                        await client.post(f'https://api.telegram.org/bot{token}/editMessageReplyMarkup',
+                                          json={'chat_id': message['chat']['id'], 'message_id': message['message_id'],
+                                                'reply_markup': {'inline_keyboard': []}})
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -67,7 +74,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(scan, 'interval', minutes=max(5, int(os.getenv('DISCOVERY_INTERVAL_MINUTES', '60'))), id='discovery', max_instances=1, coalesce=True)
     scheduler.start()
     tasks = [asyncio.create_task(scan()), asyncio.create_task(telegram_loop()),
-             asyncio.create_task(cv_worker.run())]
+             asyncio.create_task(cv_worker.run()), asyncio.create_task(application_worker.run())]
     try:
         yield
     finally:
@@ -85,6 +92,11 @@ NO_STORE = {'Cache-Control': 'no-store', 'Referrer-Policy': 'same-origin', 'X-Fr
 class StatusChange(BaseModel):
     status: str
     note: str = ''
+
+
+class DecisionRequest(BaseModel):
+    action: str
+    token: str
 
 
 def login_redirect(request: Request):
@@ -163,7 +175,19 @@ def jobs(include_inactive: bool = False):
         for r in db.execute('SELECT job_id, source_key, url, kind, active FROM job_sources ORDER BY kind DESC, id'):
             links.setdefault(r['job_id'], []).append({'source': r['source_key'], 'url': r['url'], 'kind': r['kind'],
                                                       'active': bool(r['active'])})
-    return [{**dict(x), 'sources': links.get(x['id'], []), **cv_pipeline.cv_state(x['id'], cv_rows.get(x['id']))} for x in rows]
+    return [{**dict(x), 'sources': links.get(x['id'], []), **cv_pipeline.cv_state(x['id'], cv_rows.get(x['id'])),
+             **(workflow.job_state(x['id']) or {})} for x in rows]
+
+
+@app.post('/api/jobs/{job_id}/decision', dependencies=[Depends(auth.require_api_session)])
+def decision(job_id: int, payload: DecisionRequest):
+    """Approve & Apply / Approve CV & Apply / Reject - the same backend transition as the Telegram buttons."""
+    result = workflow.decide(job_id, payload.action, channel='dashboard', token=payload.token, actor='dashboard')
+    if result['result'] == 'invalid':
+        raise HTTPException(404 if result['message'] == 'Unknown job' else 400, result['message'])
+    if result['result'] in ('stale', 'not_available'):
+        raise HTTPException(409, result['message'])
+    return dict(result)
 
 
 @app.get('/api/discovery/health', dependencies=[Depends(auth.require_api_session)])
@@ -247,7 +271,7 @@ DASHBOARD_HTML = '''<!doctype html><html lang="en"><head><meta charset="utf-8"><
 const notice=s=>document.getElementById('notice').textContent=s;
 async function request(path,options={}){const r=await fetch(path,{...options,credentials:'same-origin',headers:{'Content-Type':'application/json',...(options.headers||{})}});if(r.status===401){location.href='/login';throw new Error('Session expired')}if(!r.ok)throw new Error(await r.text());return r.json()}
 async function loadHealth(){try{const h=await request('/api/discovery/health');const body=document.getElementById('sources');body.replaceChildren();let bad=0;for(const s of h.sources){if(['failed','rate_limited'].includes(s.status))bad++;const tr=document.createElement('tr');for(const v of [s.source_key,s.status,(s.last_success_at||'never').slice(0,16).replace('T',' '),s.fetched,s.accepted,s.new_unique,s.duplicates,s.errors,s.last_error||'']){const td=document.createElement('td');td.textContent=v??'';tr.append(td)}body.append(tr)}const r=h.last_run;document.getElementById('health-summary').textContent='Sources: '+h.sources.length+' tracked, '+bad+' failing'+(r?' — last scan '+r.finished_at.slice(0,16).replace('T',' ')+' UTC: '+r.fetched+' checked, '+r.new_unique+' new, '+r.duplicates+' duplicates merged':'')}catch(e){}}
-async function loadJobs(){loadHealth();try{const data=await request('/api/jobs'+(document.getElementById('inactive').checked?'?include_inactive=true':''));const body=document.getElementById('jobs');body.replaceChildren();for(const j of data){const tr=document.createElement('tr');const cell=()=>{const td=document.createElement('td');tr.append(td);return td};const name=cell();const link=document.createElement('a');link.href=j.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent=j.title;const tier=document.createElement('span');tier.className='tier '+(j.relevance_tier||'');tier.textContent=j.relevance_tier||'';name.append(link,tier,document.createElement('br'),document.createTextNode(j.employer||j.company));if(j.language_req&&j.language_req.startsWith('dutch')){const l=document.createElement('small');l.className='warn';l.textContent=' · '+j.language_req.replace('_',' ');name.append(l)}const via=document.createElement('small');via.textContent='via '+j.sources.map(s=>s.source).join(', ')+(j.availability!=='active'?' · '+j.availability:'');name.append(document.createElement('br'),via);const loc=cell();loc.textContent=j.location_label||j.location||'—';if(j.location_region==='nl_other'){const o=document.createElement('small');o.textContent=' (outside Randstad)';loc.append(o)}cell().textContent=j.score+'/100';cell().textContent=j.status;const cvCell=cell();cvCell.textContent=j.cv_status.replace('_',' ');const detail=j.cv_error||j.cv_warnings.join(' | ');if(detail){const s=document.createElement('small');s.textContent=detail.slice(0,300);cvCell.append(document.createElement('br'),s)}const actions=cell();if(j.cv_has_file){const cv=document.createElement('button');cv.textContent='HTML CV';cv.onclick=()=>window.open('/api/jobs/'+j.id+'/cv','_blank','noopener');actions.append(cv)}if(['none','legacy','failed'].includes(j.cv_status)){const g=document.createElement('button');g.textContent=j.cv_status==='failed'?'Retry CV':'Generate CV';g.style.margin='3px';g.onclick=async()=>{try{const r=await request('/api/jobs/'+j.id+'/cv/generate',{method:'POST'});notice('CV '+r.cv_status);loadJobs()}catch(e){notice(e.message)}};actions.append(g)}for(const status of ['approved','needs_revision','rejected','applied','interview','closed']){const b=document.createElement('button');b.textContent=status.replace('_',' ');b.style.margin='3px';b.onclick=async()=>{let note='';if(status==='applied'){note=prompt('Enter submission confirmation/reference (required):')||'';if(!note.trim())return notice('Confirmation is required to record applied')}try{await request('/api/jobs/'+j.id+'/status',{method:'POST',body:JSON.stringify({status,note})});loadJobs()}catch(e){notice(e.message)}};actions.append(b)}body.append(tr)}let msg='Loaded '+data.length+' jobs';try{const w=await request('/api/cv-worker');if(w.quota)msg+=' — automatic CVs today: '+w.quota.used_today+'/'+(w.quota.daily_limit<0?'∞':w.quota.daily_limit)+(w.quota.queued_automatic?', '+w.quota.queued_automatic+' queued':'');if(w.paused_reason)msg+=' — CV generation paused: '+w.paused_reason}catch(e){}notice(msg)}catch(e){notice(e.message)}}
+async function loadJobs(){loadHealth();try{const data=await request('/api/jobs'+(document.getElementById('inactive').checked?'?include_inactive=true':''));const body=document.getElementById('jobs');body.replaceChildren();for(const j of data){const tr=document.createElement('tr');const cell=()=>{const td=document.createElement('td');tr.append(td);return td};const name=cell();const link=document.createElement('a');link.href=j.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent=j.title;const tier=document.createElement('span');tier.className='tier '+(j.relevance_tier||'');tier.textContent=j.relevance_tier||'';name.append(link,tier,document.createElement('br'),document.createTextNode(j.employer||j.company));if(j.language_req&&j.language_req.startsWith('dutch')){const l=document.createElement('small');l.className='warn';l.textContent=' · '+j.language_req.replace('_',' ');name.append(l)}const via=document.createElement('small');via.textContent='via '+j.sources.map(s=>s.source).join(', ')+(j.availability!=='active'?' · '+j.availability:'');name.append(document.createElement('br'),via);const wf=document.createElement('small');wf.textContent=' · '+(j.workflow||'')+(j.ai_keywords&&j.ai_keywords.length?' · AI: '+j.ai_keywords.join(', '):'')+(j.application_status?' · application: '+j.application_status.replace(/_/g,' '):'');name.append(wf);if(j.application_detail&&j.application_detail.reason){const r=document.createElement('small');r.className='warn';r.textContent=' · '+j.application_detail.reason;name.append(document.createElement('br'),r)}const ap=document.createElement('a');ap.href=j.apply_url||j.url;ap.target='_blank';ap.rel='noopener noreferrer';ap.textContent=' apply ↗';name.append(ap);const loc=cell();loc.textContent=j.location_label||j.location||'—';if(j.location_region==='nl_other'){const o=document.createElement('small');o.textContent=' (outside Randstad)';loc.append(o)}cell().textContent=j.score+'/100';cell().textContent=j.status;const cvCell=cell();cvCell.textContent=j.cv_status.replace('_',' ');const detail=j.cv_error||j.cv_warnings.join(' | ');if(detail){const s=document.createElement('small');s.textContent=detail.slice(0,300);cvCell.append(document.createElement('br'),s)}const actions=cell();if(j.cv_has_file){const cv=document.createElement('button');cv.textContent='HTML CV';cv.onclick=()=>window.open('/api/jobs/'+j.id+'/cv','_blank','noopener');actions.append(cv)}if(['none','legacy','failed'].includes(j.cv_status)){const g=document.createElement('button');g.textContent=j.cv_status==='failed'?'Retry CV':'Generate CV';g.style.margin='3px';g.onclick=async()=>{try{const r=await request('/api/jobs/'+j.id+'/cv/generate',{method:'POST'});notice('CV '+r.cv_status);loadJobs()}catch(e){notice(e.message)}};actions.append(g)}const labels={approve_apply:'Approve & Apply',approve_cv_apply:'Approve CV & Apply',reject:'Reject'};for(const a of (j.actions||[])){const d=document.createElement('button');d.textContent=labels[a];d.style.margin='3px';if(a==='reject')d.style.background='#8a1c1c';d.onclick=async()=>{if(a!=='reject'&&!confirm(labels[a]+': '+j.title+'?\n'+(a==='approve_apply'?'Submits the current CV version (if automatic submission is enabled).':'Generates and validates the CV, then applies - no second approval.')))return;try{const r=await request('/api/jobs/'+j.id+'/decision',{method:'POST',body:JSON.stringify({action:a,token:j.token})});notice(r.message);loadJobs()}catch(e){notice(e.message)}};actions.append(d)}for(const status of ['needs_revision','applied','interview','closed']){const b=document.createElement('button');b.textContent=status.replace('_',' ');b.style.margin='3px';b.onclick=async()=>{let note='';if(status==='applied'){note=prompt('Enter submission confirmation/reference (required):')||'';if(!note.trim())return notice('Confirmation is required to record applied')}try{await request('/api/jobs/'+j.id+'/status',{method:'POST',body:JSON.stringify({status,note})});loadJobs()}catch(e){notice(e.message)}};actions.append(b)}body.append(tr)}let msg='Loaded '+data.length+' jobs';try{const w=await request('/api/cv-worker');if(w.quota)msg+=' — automatic CVs today: '+w.quota.used_today+'/'+(w.quota.daily_limit<0?'∞':w.quota.daily_limit)+(w.quota.queued_automatic?', '+w.quota.queued_automatic+' queued':'');if(w.paused_reason)msg+=' — CV generation paused: '+w.paused_reason}catch(e){}notice(msg)}catch(e){notice(e.message)}}
 async function scan(){notice('Scanning…');try{const r=await request('/api/scan',{method:'POST'});notice('Checked '+r.checked+' jobs, added '+r.new);await loadJobs()}catch(e){notice(e.message)}}
 loadJobs();
 </script></body></html>'''
