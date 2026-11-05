@@ -11,11 +11,11 @@ candidate). Numbers are from the first full live run; later runs found 1 more.
 |---|---|
 | Sources / source types researched | 9 job APIs, 9 ATS platforms, 34 named employers, 7 major platforms (+ ~300 employer slugs probed) |
 | Implemented adapters | **18** (9 ATS + 9 job-board APIs) |
-| Enabled by default | **69 source instances**: 62 employer boards + 7 job-board APIs (production also keeps `lever:sambatv` from its local `search.yaml`) |
+| Enabled by default | **74 source instances**: 62 employer ATS boards + 5 Workday sites + 7 job-board APIs (production also keeps `lever:sambatv` from its local `search.yaml`) |
 | Live-tested successfully | **72**: all 62 default boards + 7 APIs returned valid data in 5 full runs (2 transient connect timeouts, Himalayas and Jobicy, recovered next run); Workday opt-in returned real NL vacancies for Philips, NVIDIA and Wolters Kluwer (run cut off by my time limit before ING/RELX finished) |
 | Returned relevant NL vacancies in the live test | 33 source instances |
 | Optional / credential-dependent | 2 (Adzuna, Jooble) - implemented, `not_configured` until keys are set; not live-tested |
-| Opt-in (disabled by default) | Workday (Philips, NVIDIA, ING, RELX, Wolters Kluwer) |
+| Workday | **enabled** (2026-11-05, after 2 live runs each): Philips, NVIDIA, ING (global site `ICSGBLCOR`), Elsevier (RELX `ElsevierJobs`), Wolters Kluwer; RELX generic site disabled (0 relevant NL roles, covered by Elsevier site) |
 | Unsupported / blocked | LinkedIn, Indeed, Glassdoor, Welcome to the Jungle, Nationale Vacaturebank, Intermediair, Magnet.me; employer sites without a public feed (see below) |
 
 ## Job-board / aggregator APIs
@@ -47,11 +47,13 @@ disappears for 2 successful scans is marked closed.
 | Workable | `apply.workable.com/api/v1/widget/accounts/{account}?details=true` | 1 (Hugging Face) | 0 (rate-limits hard: 6 s pacing) |
 | Personio | `{company}.jobs.personio.de/xml` (documented XML feed) | 1 (Ohpen) | 0 |
 | Teamtailor | `{subdomain}.teamtailor.com/jobs.rss` (public RSS) | 2 (Sendcloud, Lightyear) | 0 |
-| Workday | `{tenant}.wdN.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs` (POST search + detail) | **opt-in**, 5 configured | live: Philips (Amsterdam, Eindhoven), NVIDIA (NL remote), Wolters Kluwer (Alphen a/d Rijn, Hoevelaken) |
+| Workday | `{tenant}.wdN.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs` (POST search + detail) | 5 enabled (+1 disabled) | Elsevier 4, Wolters Kluwer 4, Philips 3, NVIDIA 2, ING 0 |
 
-**Workday is opt-in** because its JSON search endpoint is not documented by Workday. It is public, needs no
-login, serves the employer's own career site, and robots.txt on the tenants checked (Philips, NVIDIA) only
-disallows internal/talent-community paths. Enable per employer in `discovery.yaml` if you are comfortable with that.
+**Workday:** the JSON search endpoint is not documented by Workday, but it is public, needs no login, serves the
+employer's own career site, and every enabled tenant's robots.txt explicitly `Allow`s that site (only
+internal/talent-community and `/refreshFacet/` paths are disallowed). Enabled at the owner's request after two
+reliable live runs per site (see `docs/agent-reports/2026-11-05_1056_PR-6_scoring-cv-quota-digests-workday.md`).
+ING's `ICSNLDGEN` site (configured earlier) holds only ~5 postings; the global `ICSGBLCOR` site is used instead.
 
 Boards that were found but rarely have NL AI roles (Stripe, Datadog, Elastic, Snowflake, Samsara, HelloFresh, ...)
 cost one list request per scan and are kept so new NL roles are caught; remove them to save requests.
@@ -64,16 +66,16 @@ cost one list request per scan and are kept so new NL roles are caught; remove t
 | Booking.com | own site jobs.booking.com (robots allows, crawl-delay 5); no documented feed; not on probed ATS | no |
 | Prosus | Ashby `prosus` | yes |
 | Picnic | SmartRecruiters `Picnic` (2 jobs); own site jobs.picnic.app disallows `/api/` for crawlers | yes (SmartRecruiters only) |
-| Philips | Workday `philips` | opt-in |
+| Philips | Workday `philips` | yes |
 | TomTom | not on probed ATS; Workday guess returned 422 | no |
-| ING | Workday `ing` / `ICSNLDGEN` | opt-in |
+| ING | Workday `ing` / `ICSGBLCOR` | yes |
 | ABN AMRO | not found on probed ATS | no |
 | Rabobank | not found (Workday 404) | no |
 | ASML | own site; robots.txt disallows job-search query URLs | no (not permitted) |
 | Databricks | Greenhouse `databricks` | yes |
 | Microsoft / Google / Amazon NL | own career sites; no documented public job APIs | no |
 | Uber | own site (SmartRecruiters `uber` has 1 non-NL job) | no |
-| NVIDIA | Workday `nvidia` | opt-in |
+| NVIDIA | Workday `nvidia` | yes |
 | Elastic | Greenhouse `elastic` | yes |
 | Mollie | Ashby `mollie` | yes |
 | WeTransfer, Backbase, Deloitte, Capgemini, CGI, Accenture | not found on probed ATS (Accenture Workday 422) | no |

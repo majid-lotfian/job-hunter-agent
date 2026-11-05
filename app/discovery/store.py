@@ -256,7 +256,8 @@ def _match_existing(db, rec, n):
         for cand in _candidates(db, n['employer_key'], n['title_key']):
             same, why = dedupe.is_same_job(cand, source_key=rec.source_key, employer_key=n['employer_key'],
                                            title_key=n['title_key'], seniority=n['seniority_sig'],
-                                           region=n['location'].region, city=n['location'].city, description=rec.description)
+                                           region=n['location'].region, city=n['location'].city, description=rec.description,
+                                           aggregator=rec.kind == AGGREGATOR)
             if same:
                 return cand.job_id, why
     return None, None

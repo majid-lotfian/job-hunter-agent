@@ -90,14 +90,15 @@ sources:
   teamtailor:
     - {subdomain: sendcloud, name: Sendcloud}
     - {subdomain: lightyear, name: Lightyear}
-  # Workday career-site search: public but undocumented JSON endpoint (robots.txt does not disallow it).
-  # OPT-IN: set enabled: true per employer after reviewing docs/discovery/SOURCES.md.
+  # Workday career-site search (public, no login; robots.txt explicitly allows each site below). Query-based, so
+  # absence is never treated as closure. Each entry passed 2 live test runs on 2026-11-05 (see agent report).
   workday:
-    - {tenant: philips, wd: wd3, site: jobs-and-careers, name: Philips, enabled: false}
-    - {tenant: nvidia, wd: wd5, site: NVIDIAExternalCareerSite, name: NVIDIA, enabled: false}
-    - {tenant: ing, wd: wd3, site: ICSNLDGEN, name: ING, enabled: false}
-    - {tenant: relx, wd: wd3, site: relx, name: RELX / Elsevier, enabled: false}
-    - {tenant: wk, wd: wd3, site: External, name: Wolters Kluwer, enabled: false}
+    - {tenant: philips, wd: wd3, site: jobs-and-careers, name: Philips, enabled: true}
+    - {tenant: nvidia, wd: wd5, site: NVIDIAExternalCareerSite, name: NVIDIA, enabled: true}
+    - {tenant: ing, wd: wd3, site: ICSGBLCOR, name: ING, enabled: true}          # ICSNLDGEN has only ~5 postings
+    - {tenant: relx, id: relx-elsevier, wd: wd3, site: ElsevierJobs, name: Elsevier (RELX), enabled: true}
+    - {tenant: relx, wd: wd3, site: relx, name: RELX, enabled: false}            # works, 0 relevant NL roles in 2 runs; Elsevier site covers RELX in NL
+    - {tenant: wk, wd: wd3, site: External, name: Wolters Kluwer, enabled: true}
 
   # ---------------- Job-board / aggregator APIs (free, no key) ----------------
   arbeitnow: {max_pages: 6}                 # EU board with many NL/DE tech jobs

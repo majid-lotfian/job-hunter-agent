@@ -141,7 +141,19 @@ def location_eligible(loc, description='', config=None):
     return False, f'location {loc.region}'
 
 
+_TITLE_REGION = re.compile(r'(?:\s[-–—|,]\s*|\()\s*(us|usa|u\.s\.|united states|uk|canada|latam|apac|india|americas|north america|'
+                           r'brazil|mexico|australia|singapore|japan)\b(?:\s*only)?\s*\)?\s*$', _I)
+_TITLE_EU = re.compile(r'\b(eu|europe|emea|netherlands|nl|amsterdam|remote[- ]eu)\b', _I)
+
+
+def title_region_conflict(title):
+    """'Staff AI Engineer - US' / '(Canada)': the title restricts the role to a non-NL region."""
+    return bool(_TITLE_REGION.search(title or '')) and not _TITLE_EU.search(title or '')
+
+
 def classify(title, description, loc, config=None):
+    if title_region_conflict(title) and not (config or {}).get('allow_relocation'):
+        return Classification(tier='none', accepted=False, reasons=['not evaluated', 'title restricts the role to a non-NL region'])
     ok_loc, loc_reason = location_eligible(loc, description, config)
     if not ok_loc:  # cheap check first: most postings are outside the Netherlands
         return Classification(tier='none', accepted=False, reasons=['not evaluated', loc_reason], location_ok=False)

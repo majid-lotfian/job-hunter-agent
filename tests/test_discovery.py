@@ -370,6 +370,14 @@ class RelevanceTests(unittest.TestCase):
             self.assertEqual(relevance.role_tier(t, AI_DESC)[0], 'none', t)
         self.assertEqual(relevance.role_tier('Senior Backend Developer (Java, Agentic LLMs)', '')[0], 'secondary')
 
+    def test_title_region_conflict(self):
+        loc = normalize.parse_location('Remote - Netherlands, Spain, United States')
+        self.assertFalse(relevance.classify('Staff AI Engineer - US', AI_DESC, loc).accepted)
+        self.assertFalse(relevance.classify('ML Engineer (Canada)', AI_DESC, loc).accepted)
+        self.assertTrue(relevance.classify('Staff AI Engineer - EU', AI_DESC, loc).accepted)
+        self.assertTrue(relevance.classify('ML Engineer - Amsterdam', AI_DESC, loc).accepted)
+        self.assertTrue(relevance.classify('ML Engineer, Ads', AI_DESC, loc).accepted)
+
     def test_location_eligibility(self):
         ok = lambda text, desc='': relevance.location_eligible(normalize.parse_location(text), desc)[0]
         self.assertTrue(ok('Amsterdam'))
@@ -402,6 +410,14 @@ class DedupeTests(unittest.TestCase):
     def test_cross_source_copy_merges(self):
         self.assertTrue(self.same(self.cand()))
         self.assertTrue(self.same(self.cand(region='nl_unspecified', city=None), description=AI_DESC + ' Apply now.'))
+
+    def test_aggregator_reposts_merge_but_employer_boards_do_not(self):
+        cand = self.cand(source_keys=frozenset({'himalayas'}), region='remote_nl', city=None)
+        args = dict(source_key='himalayas', region='remote_nl', city=None, description=AI_DESC)
+        self.assertTrue(self.same(cand, aggregator=True, **args))                      # identical repost on an aggregator
+        self.assertFalse(self.same(cand, aggregator=False, **args))                    # employer ATS: other requisition
+        self.assertFalse(self.same(cand, aggregator=True, source_key='himalayas', region='remote_nl', city=None,
+                                   description=AI_DESC[:300] + ' Different team, different scope and responsibilities. ' * 10))
 
     def test_conservative_non_merges(self):
         self.assertFalse(self.same(self.cand(), seniority=''))                         # different seniority
@@ -804,7 +820,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(sum(1 for s in sources if s.key == 'lever:jobgether'), 1)   # not duplicated
         jobgether = next(s for s in sources if s.key == 'lever:jobgether')
         self.assertEqual((jobgether.kind, jobgether.locations), (AGGREGATOR, ['Netherlands']))
-        self.assertTrue(all(not s.enabled for s in sources if s.family == 'workday'))  # opt-in
+        workday = {s.key: s.enabled for s in sources if s.family == 'workday'}
+        self.assertEqual(workday, {'workday:philips': True, 'workday:nvidia': True, 'workday:ing': True,
+                                   'workday:relx-elsevier': True, 'workday:relx': False, 'workday:wk': True})
+        self.assertEqual(next(s for s in sources if s.key == 'workday:ing').site, 'ICSGBLCOR')
         self.assertEqual(cfg['notifications']['min_score'], 25)
         self.assertGreaterEqual(len(sources), 60)
 

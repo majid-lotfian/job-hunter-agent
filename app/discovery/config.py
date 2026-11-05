@@ -55,7 +55,7 @@ def build_sources(cfg):
                 if not slug:
                     errors.append(f'{family}: entry without "{SLUG_FIELD[family]}"')
                     continue
-                built.append(cls(f'{family}:{slug}', entry))
+                built.append(cls(f"{family}:{entry.get('id') or slug}", entry))  # optional id: several sites per tenant
         elif family in BOARD_SOURCES:
             options = spec if isinstance(spec, dict) else {'enabled': bool(spec)}
             built.append(BOARD_SOURCES[family](family, options))

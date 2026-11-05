@@ -14,6 +14,7 @@ from dataclasses import dataclass
 NL_REGIONS = ('randstad', 'nl_other', 'nl_unspecified', 'remote_nl')
 MIN_DESC = 400
 DESC_THRESHOLD = 0.35
+REPOST_THRESHOLD = 0.9   # same aggregator, near-identical text: a repost (e.g. per location), not a new requisition
 
 
 @dataclass
@@ -60,7 +61,7 @@ def description_similarity(a, b):
     return len(sa & sb) / len(sa | sb)
 
 
-def is_same_job(candidate, *, source_key, employer_key, title_key, seniority, region, city, description):
+def is_same_job(candidate, *, source_key, employer_key, title_key, seniority, region, city, description, aggregator=False):
     """Conservative fuzzy match of a new record against a stored job. Returns (bool, reason)."""
     if not employer_key or not title_key or candidate.availability == 'closed':
         return False, 'missing employer/title or job closed'
@@ -69,7 +70,13 @@ def is_same_job(candidate, *, source_key, employer_key, title_key, seniority, re
     if (candidate.seniority or '') != (seniority or ''):
         return False, 'seniority differs'
     if source_key in candidate.source_keys:
-        return False, 'different requisition on the same board'
+        # Employer boards: a second id is a different requisition. Aggregators often list the same vacancy
+        # several times; merge only near-identical postings there.
+        if not (aggregator and len(description or '') >= MIN_DESC and len(candidate.description or '') >= MIN_DESC
+                and location_compatible(candidate.region, candidate.city, region, city)
+                and description_similarity(candidate.description, description) >= REPOST_THRESHOLD):
+            return False, 'different requisition on the same board'
+        return True, 'repost on the same aggregator (near-identical description)'
     if not location_compatible(candidate.region, candidate.city, region, city):
         return False, 'locations differ'
     if len(candidate.description or '') >= MIN_DESC and len(description or '') >= MIN_DESC:
