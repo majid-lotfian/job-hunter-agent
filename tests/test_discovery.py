@@ -556,7 +556,8 @@ class EngineTests(unittest.TestCase):
             self.discover([interval], force=False)  # attempted moments ago -> skipped
         with core.connect() as db:
             health = {r['source_key']: r['status'] for r in db.execute('SELECT * FROM source_health')}
-        self.assertEqual(health, {'workday:x': 'disabled', 'adzuna': 'not_configured', 'greenhouse:empty': 'skipped'})
+        # a skipped run keeps showing the last real outcome ('empty') instead of hiding it
+        self.assertEqual(health, {'workday:x': 'disabled', 'adzuna': 'not_configured', 'greenhouse:empty': 'empty'})
         self.assertEqual(interval.calls, 0)
         self.assertEqual(disabled.calls, 0)
 
@@ -751,6 +752,21 @@ class MigrationTests(unittest.TestCase):
         with core.connect() as db:
             rows = db.execute('SELECT status FROM jobs').fetchall()
         self.assertEqual((summary['new'], len(rows), rows[0][0]), (0, 1, 'approved'))
+
+
+class RollbackTests(unittest.TestCase):
+    def test_jobs_inserted_without_links_are_linked_on_start_and_not_duplicated(self):
+        reset_db()
+        with core.connect() as db:  # what the previous app version would insert after a rollback
+            db.execute("INSERT INTO jobs (source,source_id,company,title,location,url,discovered_at,score) VALUES "
+                       "('greenhouse','42','acme','AI Engineer','Amsterdam','https://boards.greenhouse.io/acme/jobs/42','2026-11-05',70)")
+        core.init_db()
+        src = FakeSource('greenhouse:acme', [rec(job_id='42', title='AI Engineer')])
+        summary = run(engine.run_discovery(sources=[src], cfg=test_cfg(), http=make_http(lambda r: httpx.Response(500)),
+                                           notifier={'job': mock.AsyncMock(), 'text': mock.AsyncMock()}, force=True))
+        with core.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 1)
+        self.assertEqual(summary['new'], 0)
 
 
 class ConfigTests(unittest.TestCase):

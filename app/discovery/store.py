@@ -97,6 +97,7 @@ def migrate():
         version = db.execute('PRAGMA user_version').fetchone()[0]
         has_jobs = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone()
     if version >= SCHEMA_VERSION:
+        link_orphans()
         return False
     if has_jobs:
         with connect() as db:
@@ -120,6 +121,14 @@ def migrate():
         db.close()
     log.info('Discovery schema migrated to version %d', SCHEMA_VERSION)
     return True
+
+
+def link_orphans():
+    """Jobs inserted without provenance (e.g. by an older app version after a rollback, or by hand) get their
+    link, so the engine recognizes them instead of creating duplicates. Cheap no-op normally."""
+    with connect() as db:
+        if db.execute('SELECT 1 FROM jobs j LEFT JOIN job_sources s ON s.job_id=j.id WHERE s.id IS NULL LIMIT 1').fetchone():
+            _backfill_links(db)
 
 
 def _legacy_source_key(row):
@@ -330,7 +339,9 @@ def record_health(db, source_key, family, status, *, enabled=True, attempted=Non
     stats = stats or {}
     success = status in ('ok', 'empty', 'partial')
     db.execute('INSERT OR IGNORE INTO source_health (source_key, family) VALUES (?, ?)', (source_key, family))
-    if attempted is None:  # skipped / disabled / not configured: keep the last real counts
+    if status == 'skipped':  # interval not elapsed: keep showing the last real outcome
+        return
+    if attempted is None:  # disabled / not configured: keep the last real counts
         db.execute('UPDATE source_health SET status=?, enabled=?, family=?, last_error=COALESCE(?, last_error) WHERE source_key=?',
                    (status, int(enabled), family, error, source_key))
         return

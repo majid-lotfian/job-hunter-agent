@@ -63,7 +63,7 @@ def to_iso(value):
 
 # --------------------------------------------------------------------------- geography
 
-# Randstad and realistic commuting locations (Almere-based candidate). Multi-word names first.
+# Randstad and realistic commuting locations. Multi-word names first.
 RANDSTAD_PLACES = sorted([
     'amsterdam', 'amstelveen', 'almere', 'utrecht', 'hilversum', 'amersfoort', 'haarlem', 'leiden', 'den haag',
     'the hague', 'hague', "'s-gravenhage", 's-gravenhage', 'rotterdam', 'delft', 'schiphol', 'hoofddorp',
