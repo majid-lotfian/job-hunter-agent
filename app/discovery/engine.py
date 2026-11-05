@@ -2,7 +2,7 @@
 
 For every configured source (bounded concurrency, per-source interval, isolated failures):
   fetch -> skip unchanged known postings -> cheap pre-filter -> (detail fetch) -> normalize ->
-  relevance + location classification -> existing score_job -> dedupe/upsert -> lifecycle -> health.
+  relevance + location classification -> score_job (title + requirements) -> dedupe/upsert -> lifecycle -> health.
 Then: CV queue hook for new logical jobs, Telegram (capped, digest for first scans of new sources).
 No LLM calls happen during discovery.
 """
@@ -127,14 +127,16 @@ async def _process(run, rec, http, ctx, cfg, now_dt, now, state):
         loc.label = 'Netherlands (per description)' if loc.region == 'unknown' else 'Remote (Europe per description)'
     # Existing scoring, unchanged. A complete employer listing proves the job is open, so the age
     # window (search.yaml max_age_days) is applied to aggregator postings only.
+    language_req = language_requirement(rec.title, rec.description)
     score = core.score_job({'title': rec.title, 'description': rec.description, 'location': loc.label or rec.location or '',
+                            'location_region': loc.region, 'language_req': language_req,
                             'published_at': rec.published_at if rec.kind == AGGREGATOR else None}, cfg['matching'])
     sen = seniority(rec.title, rec.seniority_hint)
     keys = [k for k in dict.fromkeys([ats_key(rec.url), ats_key(rec.apply_url)]) if k]
     n = {'location': loc, 'score': max(score, 0), 'tier': cls.tier, 'reason': '; '.join(cls.reasons),
          'employer_key': employer_key(rec.employer), 'title_key': title_key(rec.title), 'seniority_sig': seniority_sig(sen),
          'seniority_label': seniority_label(sen), 'employment_type': employment_type(rec.employment_type),
-         'language_req': language_requirement(rec.title, rec.description), 'canonical_url': canonical_url(rec.url),
+         'language_req': language_req, 'canonical_url': canonical_url(rec.url),
          'canonical_apply_url': canonical_url(rec.apply_url), 'ats_keys': keys,
          'priority': store.PRIORITY.get(rec.kind, 1), 'listing': 'complete' if src.complete_listing else 'search'}
     with state.db:
@@ -177,7 +179,6 @@ async def _run_source(source, http, cfg, run_started, force):
         with core.connect() as db:
             store.record_health(db, source.key, source.family, run.status, enabled=source.enabled, error=run.error)
         return run
-    baseline = not health or not health['last_success_at']
     from . import sources as _s
     ctx = _s.FetchContext()
     started = time.monotonic()
@@ -211,8 +212,6 @@ async def _run_source(source, http, cfg, run_started, force):
         with core.connect() as db:
             closed = store.mark_missing(db, source.key, attempted, cfg['settings']['close_after_missed_scans'])
     run.stats['closed'] = closed
-    for job in run.new_jobs:
-        job['baseline'] = baseline
     with core.connect() as db:
         store.record_health(db, source.key, source.family, run.status, enabled=True, attempted=attempted,
                             stats=run.stats, error=run.error, duration_ms=int((time.monotonic() - started) * 1000))
@@ -222,34 +221,44 @@ async def _run_source(source, http, cfg, run_started, force):
     return run
 
 
-async def _notify(new_jobs, cfg, notifier):
+DIGEST_MAX_LINES = 15
+
+
+async def _notify(cfg, notifier):
+    """One Telegram digest of every relevant job not yet announced (persistent `jobs.notified_at`).
+    Jobs are marked only after a successful send, so restarts never repeat a job and a failed send is
+    retried at the next scan. Irrelevant/low-score jobs are marked silently. Returns 1 if a digest was sent."""
     ncfg = cfg['notifications']
-    relevant = sorted((j for j in new_jobs if j['tier'] in ('primary', 'secondary') and j['score'] >= ncfg['min_score']),
-                      key=lambda j: (-j['score'], TIER_RANK[j['tier']]))
-    individual = [j for j in relevant if not (ncfg['digest'] and j['baseline'])]
-    digest = [j for j in relevant if ncfg['digest'] and j['baseline']]
-    if len(individual) > ncfg['max_individual_per_run']:
-        digest, individual = relevant, []
-    send_job = notifier.get('job') if notifier else core.notify
-    send_text = notifier.get('text') if notifier else core.send_telegram
+    with core.connect() as db:
+        pending = [dict(r) for r in db.execute(
+            """SELECT j.id, j.title, j.employer, j.company, j.score, j.location_label, j.location, j.url, j.relevance_tier,
+                      j.language_req, c.status AS cv_status FROM jobs j LEFT JOIN cv_jobs c ON c.job_id=j.id
+               WHERE j.notified_at IS NULL ORDER BY j.score DESC, j.id""")]
+    if not pending:
+        return 0
+    relevant = [j for j in pending if j['relevance_tier'] in ('primary', 'secondary') and j['score'] >= ncfg['min_score']
+                and (j['location_label'] or j['location'])]
     sent = 0
-    for j in individual:
-        try:
-            await send_job(j['job_id'], j)
-            sent += 1
-        except Exception:
-            log.exception('Telegram notification failed for job %s', j['job_id'])
-    if digest:
-        lines = [f"Job discovery: {len(digest)} new relevant job(s)"]
-        lines += [f"• {j['score']}/100 {j['title']} — {j['company']} ({j['location']})" for j in digest[:12]]
-        if len(digest) > 12:
-            lines.append(f'… and {len(digest) - 12} more')
+    if relevant:
+        lines = [f'Job discovery: {len(relevant)} new relevant job(s)']
+        for j in relevant[:DIGEST_MAX_LINES]:
+            cv = {'pending': 'CV queued', 'generating': 'CV generating', 'ready': 'CV ready', 'needs_review': 'CV needs review',
+                  'failed': 'CV failed'}.get(j['cv_status'], 'no automatic CV')
+            dutch = ' · Dutch required' if j['language_req'] == 'dutch_required' else ''
+            lines.append(f"• {j['score']}/100 {j['title']} — {j['employer'] or j['company']} "
+                         f"({j['location_label'] or j['location']}) · {cv}{dutch}\n  {j['url']}")
+        if len(relevant) > DIGEST_MAX_LINES:
+            lines.append(f'… and {len(relevant) - DIGEST_MAX_LINES} more in the dashboard')
         lines.append(f'Dashboard: {core.dashboard_base()}')
+        send_text = notifier.get('text') if notifier else core.send_telegram
         try:
-            await send_text('\n'.join(lines))
-            sent += 1
+            await send_text('\n'.join(lines)[:3900])
+            sent = 1
         except Exception:
-            log.exception('Telegram digest failed')
+            log.exception('Telegram discovery digest failed; will retry next scan')
+            return 0
+    with core.connect() as db:
+        db.executemany('UPDATE jobs SET notified_at=? WHERE id=?', [(core.now_iso(), j['id']) for j in pending])
     return sent
 
 
@@ -296,7 +305,7 @@ async def run_discovery(on_new_job=None, *, sources=None, cfg=None, http=None, n
                 on_new_job(job['job_id'], job['score'])  # CV queue (applies CV_MIN_SCORE itself)
             except Exception:
                 log.exception('CV queue hook failed for job %s', job['job_id'])
-    notified = await _notify(new_jobs, cfg, notifier)
+    notified = await _notify(cfg, notifier)
     statuses = Counter(r.status for r in runs)
     summary = {'checked': totals['fetched'], 'new': totals['new'], 'duplicates': totals['duplicates'],
                'accepted': totals['accepted'], 'rejected': totals['rejected'], 'unchanged': totals['unchanged'],

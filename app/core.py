@@ -60,6 +60,13 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS cv_jobs_due ON cv_jobs(status, next_attempt_at);
         ''')
+        # Additive cv_jobs columns: daily automatic quota and persistent digest notification state.
+        cv_cols = {r['name'] for r in db.execute('PRAGMA table_info(cv_jobs)')}
+        for column in ('quota_day', 'notified_at', 'completed_at'):
+            if column not in cv_cols:
+                db.execute(f'ALTER TABLE cv_jobs ADD COLUMN {column} TEXT')
+        if 'notified_at' not in cv_cols:  # outcomes that existed before digests were already announced
+            db.execute("UPDATE cv_jobs SET notified_at=updated_at WHERE status IN ('ready','needs_review','failed')")
     from .discovery import store  # lazy: store imports core
     store.migrate()
 
@@ -75,7 +82,8 @@ def get_cv_job(job_id):
 
 def set_cv_job(job_id, status, **fields):
     """Insert or update the cv_jobs row for a job. Unspecified columns keep their value."""
-    allowed = {'reason', 'attempts', 'next_attempt_at', 'last_error', 'warnings', 'notes', 'model', 'source'}
+    allowed = {'reason', 'attempts', 'next_attempt_at', 'last_error', 'warnings', 'notes', 'model', 'source',
+               'quota_day', 'notified_at', 'completed_at'}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f'Unknown cv_jobs fields: {sorted(unknown)}')
@@ -103,26 +111,75 @@ def parse_date(value):
         return None
 
 
-def score_job(job, settings):
+# Target role titles (in addition to search.yaml `titles_any`). Weight = title points.
+PRIMARY_TITLES = [
+    r'machine learning (engineer|scientist|researcher)', r'\bml (engineer|scientist)', r'applied (ai )?scientist',
+    r'research (engineer|scientist)', r'deep learning (engineer|scientist)', r'\bnlp (engineer|scientist)',
+    r'natural language processing', r'foundation models? (engineer|scientist)', r'\bllm (engineer|scientist|researcher)',
+    r'generative ai (engineer|scientist)', r'\bgen ?ai (engineer|scientist)', r'agentic (ai )?engineer',
+    r'ai research scientist', r'\bai (engineer|scientist|researcher)', r'applied ai', r'computer vision (engineer|scientist)',
+]
+SECONDARY_TITLES = [
+    r'\b(ai|ml|machine learning|llm) platform engineer', r'\b(ml|llm)\s*-?ops\b', r'ai solutions? (engineer|architect)',
+    r'\b(ai|ml) architect', r'forward[- ]deployed', r'data scientist', r'\bai consultant',
+]
+SCORE_WEIGHTS = {'title_primary': 40, 'title_secondary': 30, 'title_keyword_only': 10, 'keyword': 5, 'keyword_cap': 20,
+                 'skill': 4, 'requirements_cap': 45, 'seniority': 5, 'location': 5, 'dutch_required': -10}
+
+
+def _title_points(title, matching):
+    t = title.lower()
+    if any(term.lower() in t for term in matching.get('titles_any', [])) or any(re.search(p, t) for p in PRIMARY_TITLES):
+        return SCORE_WEIGHTS['title_primary'], 'primary'
+    if any(re.search(p, t) for p in SECONDARY_TITLES):
+        return SCORE_WEIGHTS['title_secondary'], 'secondary'
+    return 0, None
+
+
+def score_breakdown(job, settings):
+    """Transparent 0-100 relevance score. Returns (score, parts); score -1 = rejected by search.yaml gates.
+
+    A matching title alone is not enough to reach CV_MIN_SCORE (70): the description must also show relevant
+    requirements (search.yaml keywords + distinct AI/ML skills). Seniority, location and Dutch-language
+    requirements adjust the score. Gates (excluded terms, locations_any, max_age_days) are unchanged.
+    """
+    from .discovery.normalize import language_requirement, parse_location, seniority
+    from .discovery.relevance import ai_signal_count
     m = settings.get('matching', {})
-    title = job['title'].lower()
-    body = (job['title'] + ' ' + job.get('description', '')).lower()
+    title = job['title'] or ''
+    description = job.get('description') or ''
+    body = (title + ' ' + description).lower()
     loc = (job.get('location') or '').lower()
-    if any(term.lower() in title for term in m.get('excluded_terms', [])):
-        return -1
-    title_match = any(term.lower() in title for term in m.get('titles_any', []))
-    keyword_match = any(term.lower() in body for term in m.get('keywords_any', []))
-    if not (title_match or keyword_match):
-        return -1
+    if any(term.lower() in title.lower() for term in m.get('excluded_terms', [])):
+        return -1, {'gate': 'excluded term'}
+    title_pts, title_kind = _title_points(title, m)
+    kw_hits = sum(k.lower() in body for k in m.get('keywords_any', []))
+    if not (title_pts or kw_hits):
+        return -1, {'gate': 'no title or keyword match'}
     places = m.get('locations_any', [])
     if places and not any(p.lower() in loc for p in places):
-        return -1
+        return -1, {'gate': 'location'}
     published = parse_date(job.get('published_at'))
     if published and published < datetime.now(timezone.utc) - timedelta(days=int(m.get('max_age_days', 30))):
-        return -1
-    score = (50 if title_match else 0) + (15 if keyword_match else 0)
-    score += min(30, 5 * sum(k.lower() in body for k in m.get('keywords_any', [])))
-    return min(score, 100)
+        return -1, {'gate': 'too old'}
+    w = SCORE_WEIGHTS
+    if not title_pts:
+        title_pts, title_kind = w['title_keyword_only'], 'keyword_only'
+    skills = ai_signal_count(description)
+    requirements = min(w['requirements_cap'], min(w['keyword_cap'], w['keyword'] * kw_hits) + w['skill'] * skills)
+    markers = seniority(title)
+    seniority_pts = w['seniority'] if markers & {'mid', 'senior', 'staff', 'lead', 'principal', 'level2', 'level3', 'level4'} else 0
+    region = job.get('location_region') or parse_location(job.get('location') or '').region
+    location_pts = w['location'] if region in ('randstad', 'nl_unspecified', 'remote_nl', 'nl_other') else 0
+    language = job.get('language_req') or language_requirement(title, description)
+    language_pts = w['dutch_required'] if language == 'dutch_required' else 0
+    score = max(0, min(100, title_pts + requirements + seniority_pts + location_pts + language_pts))
+    return score, {'title': title_pts, 'title_kind': title_kind, 'keywords': kw_hits, 'skills': skills,
+                   'requirements': requirements, 'seniority': seniority_pts, 'location': location_pts, 'language': language_pts}
+
+
+def score_job(job, settings):
+    return score_breakdown(job, settings)[0]
 
 
 def get_job(job_id):

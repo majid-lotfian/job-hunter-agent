@@ -14,7 +14,7 @@ DEFAULT_SETTINGS = {
                        'boards-api.greenhouse.io': 0.5, 'api.lever.co': 0.5, 'api.ashbyhq.com': 0.5,
                        'api.smartrecruiters.com': 0.5, 'jobs.booking.com': 5},
 }
-DEFAULT_NOTIFICATIONS = {'min_score': None, 'max_individual_per_run': 10, 'digest': True}
+DEFAULT_NOTIFICATIONS = {'min_score': None}
 
 
 def _read(filename):

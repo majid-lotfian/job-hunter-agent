@@ -14,9 +14,8 @@ settings:
   allow_relocation: false        # true = also accept onsite jobs outside the Netherlands
 
 notifications:
-  min_score: null                # Telegram for new relevant jobs with score >= this (null = search.yaml min_score)
-  max_individual_per_run: 10     # more than this -> one digest message instead
-  digest: true                   # first scan of a newly added source is summarised, not sent job-by-job
+  min_score: null                # include new relevant jobs with score >= this in the per-scan Telegram digest
+                                 # (null = search.yaml min_score). One digest per scan, never one message per job.
 
 sources:
   # ---------------- Employer ATS boards (direct postings; complete listings) ----------------

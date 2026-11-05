@@ -14,7 +14,7 @@ from .models import AGGREGATOR
 from .normalize import ats_key, canonical_url, employer_key, parse_location, seniority, seniority_label, title_key
 from .relevance import role_tier
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 JOB_COLUMNS = {
     'employer': 'TEXT', 'employer_key': 'TEXT', 'title_key': 'TEXT', 'seniority': 'TEXT', 'seniority_sig': 'TEXT',
     'location_label': 'TEXT', 'location_region': 'TEXT', 'city': 'TEXT', 'country': 'TEXT', 'remote_type': 'TEXT',
@@ -87,7 +87,14 @@ def _migrate_v2(db):
         db.execute(statement)
 
 
-MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2}
+def _migrate_v3(db):
+    """Persistent discovery-digest state; jobs that exist at migration time count as already announced."""
+    if 'notified_at' not in {r['name'] for r in db.execute('PRAGMA table_info(jobs)')}:
+        db.execute('ALTER TABLE jobs ADD COLUMN notified_at TEXT')
+    db.execute('UPDATE jobs SET notified_at=discovered_at WHERE notified_at IS NULL')
+
+
+MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2, 3: _migrate_v3}
 
 
 def migrate():

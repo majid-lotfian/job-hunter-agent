@@ -599,25 +599,47 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(store.mark_stale(db, 21), 1)
         self.assertEqual(self.jobs()[0]['availability'], 'stale')
 
-    def test_notifications_dedup_cap_and_baseline_digest(self):
-        # first scan of a new source -> one digest, no per-job messages
-        self.discover([FakeSource('greenhouse:acme', [rec(job_id=str(i), title='AI Engineer', location=c)
-                                                      for i, c in enumerate(['Amsterdam', 'Utrecht', 'Delft'])])])
-        self.assertEqual([k for k, _ in self.sent], ['digest'])
-        self.sent.clear()
-        # later scans: individual messages for genuinely new jobs only (a duplicate is not re-announced)
-        src = FakeSource('greenhouse:acme', [rec(job_id='new1', title='AI Engineer', location='Leiden'),
-                                             rec(job_id='0', title='AI Engineer', location='Amsterdam')])
+    def test_one_digest_per_scan_no_repeats_and_retry_on_failure(self):
+        src = FakeSource('greenhouse:acme', [rec(job_id=str(i), title='AI Engineer', location=c)
+                                             for i, c in enumerate(['Amsterdam', 'Utrecht', 'Delft'])])
         self.discover([src])
-        self.assertEqual([k for k, _ in self.sent], ['job'])
+        self.assertEqual([k for k, _ in self.sent], ['digest'])          # 3 jobs -> one message, not three
+        self.assertIn('3 new relevant job(s)', self.sent[0][1])
+        self.assertIn('no automatic CV', self.sent[0][1])                 # CV status included (hook only records here)
+        self.assertIn('https://boards.greenhouse.io/acme/jobs/0', self.sent[0][1])
+        self.sent.clear()
+        self.discover([src])
+        self.assertEqual(self.sent, [])                                   # nothing new -> nothing sent
+        src.records.append(rec(job_id='9', title='NLP Engineer', location='Leiden'))
+        failing = {'text': mock.AsyncMock(side_effect=RuntimeError('telegram down'))}
+        run(engine.run_discovery(sources=[src], cfg=test_cfg(), http=make_http(lambda r: httpx.Response(500)),
+                                 notifier=failing, force=True))
+        self.discover([src])                                              # retried at the next scan, exactly once
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('NLP Engineer', self.sent[0][1])
+        self.assertNotIn('Utrecht', self.sent[0][1])
         self.sent.clear()
         self.discover([src])
         self.assertEqual(self.sent, [])
-        # more than the cap -> a single digest
-        many = FakeSource('greenhouse:acme', [rec(job_id=f'x{i}', title='AI Engineer', location=c)
-                                              for i, c in enumerate(['Haarlem', 'Hilversum', 'Almere', 'Zeist'])])
-        self.discover([many], cfg=test_cfg(max_individual_per_run=2))
-        self.assertEqual([k for k, _ in self.sent], ['digest'])
+
+    def test_digest_is_bounded_for_large_batches(self):
+        cities = ['Amsterdam', 'Utrecht', 'Delft', 'Leiden', 'Haarlem', 'Hilversum', 'Almere', 'Zeist', 'Gouda', 'Rotterdam',
+                  'Schiedam', 'Rijswijk', 'Diemen', 'Weesp', 'Bussum', 'Naarden', 'Huizen', 'Baarn', 'Houten', 'Woerden']
+        self.discover([FakeSource('greenhouse:acme', [rec(job_id=f'x{i}', title='AI Engineer', location=c) for i, c in enumerate(cities)])])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('20 new relevant job(s)', self.sent[0][1])
+        self.assertIn('… and 5 more', self.sent[0][1])
+        self.assertLessEqual(len(self.sent[0][1]), 3900)
+
+    def test_digest_shows_cv_queue_status(self):
+        self.discover([FakeSource('greenhouse:acme', [rec(job_id='1', title='AI Engineer')])])
+        job_id = self.jobs()[0]['id']
+        core.set_cv_job(job_id, 'pending')
+        with core.connect() as db:
+            db.execute('UPDATE jobs SET notified_at=NULL')
+        self.sent.clear()
+        run(engine._notify(test_cfg(), self.notifier))
+        self.assertIn('CV queued', self.sent[0][1])
 
     def test_cv_queue_hook_only_for_new_relevant_jobs(self):
         src = FakeSource('greenhouse:acme', [rec(job_id='1', title='AI Engineer'), rec(job_id='2', title='Software Engineer')])

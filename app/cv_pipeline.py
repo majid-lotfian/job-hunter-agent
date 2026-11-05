@@ -10,7 +10,10 @@ background worker (started by app.main) then, one job at a time:
      using the master CV as the only source of facts;
   3. restores the original contact data locally, re-uses the master's <head> (and so
      its <style>) byte-for-byte, and validates the result against the master;
-  4. saves data/cvs/job-<id>.html and notifies you on Telegram for review.
+  4. saves data/cvs/job-<id>.html; outcomes are announced in one Telegram CV digest per batch.
+
+At most CV_DAILY_LIMIT (default 5) automatic CVs are started per local calendar day (CV_TIMEZONE, default
+Europe/Amsterdam); the rest stay queued for the next days, highest score first. Manual requests do not count.
 
 Status per job (table cv_jobs): pending -> generating -> ready | needs_review | failed.
 Temporary API failures are retried with bounded exponential backoff. ready and
@@ -33,12 +36,13 @@ import re
 import shutil
 import sys
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from bs4 import BeautifulSoup, Comment, NavigableString
 
 from . import llm
 from .core import (ROOT, connect, cv_path, dashboard_base, get_cv_job, get_job, init_db, log,
-                   now_iso, review_keyboard, send_telegram, set_cv_job)
+                   now_iso, send_telegram, set_cv_job)
 from .tailor_cv import GENERATOR, MARKER, MASTER, WORKSPACES, validate_draft
 
 STATUSES = ('pending', 'generating', 'ready', 'failed', 'needs_review')
@@ -63,7 +67,37 @@ def settings():
         'min_interval': max(0, _env_int('LLM_MIN_INTERVAL_SECONDS', 15)),
         'poll': max(5, _env_int('CV_WORKER_POLL_SECONDS', 60)),
         'config_pause': max(30, _env_int('CV_CONFIG_ERROR_PAUSE_SECONDS', 1800)),
+        # Automatic CVs per local calendar day (manual/forced CVs are not counted). Negative = unlimited.
+        'daily_limit': _env_int('CV_DAILY_LIMIT', 5),
+        'timezone': os.getenv('CV_TIMEZONE', 'Europe/Amsterdam').strip() or 'Europe/Amsterdam',
     }
+
+
+AUTO_REASONS = ('new', 'legacy')          # queued automatically (count against CV_DAILY_LIMIT)
+MANUAL_REASONS = ('manual', 'regenerate')  # dashboard button / CLI: never consume the automatic quota
+
+
+def local_day(cfg=None):
+    """Today's date (ISO) in the configured timezone; UTC if the zone is unknown."""
+    tz_name = (cfg or settings())['timezone']
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        log.warning('Unknown CV_TIMEZONE %r; using UTC for the daily CV limit', tz_name)
+        tz = timezone.utc
+    return datetime.now(tz).date().isoformat()
+
+
+def quota_status(cfg=None):
+    cfg = cfg or settings()
+    day = local_day(cfg)
+    with connect() as db:
+        used = db.execute('SELECT COUNT(*) FROM cv_jobs WHERE quota_day=?', (day,)).fetchone()[0]
+        waiting = db.execute(f"SELECT COUNT(*) FROM cv_jobs WHERE status='pending' AND reason IN "
+                             f"({','.join('?' * len(AUTO_REASONS))}) AND quota_day IS NULL", AUTO_REASONS).fetchone()[0]
+    limit = cfg['daily_limit']
+    return {'day': day, 'timezone': cfg['timezone'], 'daily_limit': limit, 'used_today': used,
+            'remaining_today': None if limit < 0 else max(0, limit - used), 'queued_automatic': waiting}
 
 
 class PipelineError(Exception):
@@ -407,11 +441,11 @@ async def process(job_id, provider, cfg=None):
         return 'ready'  # a tailored CV appeared meanwhile (e.g. Claude Code); never overwrite it
     try:
         document, warnings, notes = await generate(job, provider)
-    except llm.ConfigurationLLMError:
-        set_cv_job(job_id, 'pending', attempts=max(0, row['attempts'] - 1))
-        raise
-    except PipelineError:
-        set_cv_job(job_id, 'pending', attempts=max(0, row['attempts'] - 1))
+    except (llm.ConfigurationLLMError, PipelineError):
+        # Not the job's fault: give back the attempt and (if this claim consumed it) the daily quota slot.
+        refund = row['attempts'] <= 1 and row['quota_day'] == local_day(cfg)
+        set_cv_job(job_id, 'pending', attempts=max(0, row['attempts'] - 1),
+                   **({'quota_day': None} if refund else {}))
         raise
     except llm.TemporaryLLMError as exc:
         if row['attempts'] >= cfg['max_attempts']:
@@ -433,39 +467,64 @@ async def process(job_id, provider, cfg=None):
         db.execute('UPDATE jobs SET cv_path=? WHERE id=?', (str(path), job_id))
     status = 'needs_review' if warnings else 'ready'
     set_cv_job(job_id, status, source=provider.name, model=provider.model, last_error=None,
-               next_attempt_at=None, warnings='\n'.join(warnings) or None, notes=json.dumps(notes))
+               next_attempt_at=None, warnings='\n'.join(warnings) or None, notes=json.dumps(notes),
+               completed_at=now_iso(), notified_at=None)  # announced in the next CV digest
     log.info('CV for job %s: %s (%d warning(s))', job_id, status, len(warnings))
-    await _notify(job, status, warnings, notes)
     return status
 
 
 async def _failed(job, message):
-    set_cv_job(job['id'], 'failed', last_error=message[:1000], next_attempt_at=None)
+    set_cv_job(job['id'], 'failed', last_error=message[:1000], next_attempt_at=None, completed_at=now_iso(), notified_at=None)
     log.error('CV for job %s failed: %s', job['id'], message)
-    await _notify(job, 'failed', [message], {})
     return 'failed'
 
 
-async def _notify(job, status, warnings, notes):
-    link = f'{dashboard_base()}/api/jobs/{job["id"]}/cv'
-    head = f'{job["title"]} — {job["company"]} ({job["score"]}/100)'
-    if status == 'failed':
-        text = (f'CV generation failed\n{head}\n{warnings[0][:300]}\n'
-                f'Retry from the dashboard or use the Claude Code fallback.\nDashboard: {dashboard_base()}')
-        markup = None
-    else:
-        label = 'Tailored CV ready for review' if status == 'ready' else \
-            f'Tailored CV needs review ({len(warnings)} warning(s))'
-        gaps = notes.get('unsupported_requirements') or []
-        text = f'{label}\n{head}\nOpen: {link}'
-        if gaps:
-            text += '\nNot supported by your CV: ' + '; '.join(gaps[:5])[:400]
-        text += '\nNothing has been submitted. Review the CV, then approve or reject.'
-        markup = review_keyboard(job['id'])
+TELEGRAM_LIMIT = 3800
+
+
+async def send_cv_digest(cfg=None):
+    """One Telegram message for all CV outcomes not yet announced (ready / needs review / failed).
+    Rows are marked notified only after a successful send (or when Telegram is not configured), so a
+    restart never repeats a digest and a failed send is retried next time. Returns the number announced."""
+    cfg = cfg or settings()
+    with connect() as db:
+        rows = db.execute("""SELECT c.job_id, c.status, c.warnings, c.last_error, c.notes, j.title, j.company, j.employer, j.score
+                             FROM cv_jobs c JOIN jobs j ON j.id=c.job_id
+                             WHERE c.status IN ('ready','needs_review','failed') AND c.notified_at IS NULL
+                             ORDER BY CASE c.status WHEN 'failed' THEN 1 ELSE 0 END, j.score DESC, c.job_id""").fetchall()
+    if not rows:
+        return 0
+    ok = [r for r in rows if r['status'] != 'failed']
+    lines = [f'CV digest: {len(ok)} tailored CV(s) ready for review' + (f', {len(rows) - len(ok)} failed' if len(ok) < len(rows) else '')]
+    for r in rows:
+        head = f"• {r['score']}/100 {r['title']} — {r['employer'] or r['company']}"
+        if r['status'] == 'failed':
+            line = f"{head}: failed ({(r['last_error'] or 'unknown error')[:120]})"
+        else:
+            n_warn = len((r['warnings'] or '').splitlines())
+            status = 'ready for review' if r['status'] == 'ready' else f'needs review ({n_warn} warning(s))'
+            gaps = (json.loads(r['notes'] or '{}').get('unsupported_requirements') or [])[:3]
+            line = f"{head}: {status}\n  {dashboard_base()}/api/jobs/{r['job_id']}/cv"
+            if gaps:
+                line += '\n  Not in your CV: ' + '; '.join(gaps)[:160]
+        if sum(len(x) + 1 for x in lines) + len(line) > TELEGRAM_LIMIT - 300:
+            lines.append(f'… and {len(rows) - (len(lines) - 1)} more in the dashboard')
+            break
+        lines.append(line)
+    q = quota_status(cfg)
+    if q['queued_automatic']:
+        limit = 'unlimited' if q['daily_limit'] < 0 else f"{q['used_today']}/{q['daily_limit']} used today"
+        lines.append(f"Queued for automatic CVs: {q['queued_automatic']} (daily limit: {limit})")
+    lines.append(f'Nothing has been submitted. Review in the dashboard: {dashboard_base()}')
     try:
-        await send_telegram(text, markup)
+        await send_telegram('\n'.join(lines))
     except Exception:
-        log.exception('Telegram CV notification failed for job %s', job['id'])
+        log.exception('Telegram CV digest failed; will retry')
+        return 0
+    stamp = now_iso()
+    with connect() as db:
+        db.executemany('UPDATE cv_jobs SET notified_at=? WHERE job_id=?', [(stamp, r['job_id']) for r in rows])
+    return len(rows)
 
 
 # --------------------------------------------------------------------------- queue
@@ -512,17 +571,35 @@ def recover_stale():
         db.execute("UPDATE cv_jobs SET status='pending', updated_at=? WHERE status='generating'", (now_iso(),))
 
 
-def claim_next():
-    now = now_iso()
+def claim_next(cfg=None):
+    """Atomically claim the next due job: manual requests first, then highest score, then newest posting.
+    Automatic jobs are only claimed while today's CV_DAILY_LIMIT has room; the first claim of an automatic
+    job records the local day (one quota slot per job, never again for its retries)."""
+    cfg = cfg or settings()
+    now, day, limit = now_iso(), local_day(cfg), cfg['daily_limit']
+    manual = ','.join(f"'{r}'" for r in MANUAL_REASONS)
     with connect() as db:
-        row = db.execute("SELECT c.job_id FROM cv_jobs c JOIN jobs j ON j.id=c.job_id "
-                         "WHERE c.status='pending' AND (c.next_attempt_at IS NULL OR c.next_attempt_at<=?) "
-                         "ORDER BY j.score DESC, c.job_id LIMIT 1", (now,)).fetchone()
+        db.execute('BEGIN IMMEDIATE')  # quota check and claim in one write transaction
+        used = db.execute('SELECT COUNT(*) FROM cv_jobs WHERE quota_day=?', (day,)).fetchone()[0]
+        auto_ok = 1 if (limit < 0 or used < limit) else 0
+        row = db.execute(f"""SELECT c.job_id, c.reason, c.quota_day FROM cv_jobs c JOIN jobs j ON j.id=c.job_id
+                             WHERE c.status='pending' AND (c.next_attempt_at IS NULL OR c.next_attempt_at<=?)
+                               AND (c.reason IN ({manual}) OR c.quota_day IS NOT NULL OR ?)
+                             ORDER BY CASE WHEN c.reason IN ({manual}) THEN 0 ELSE 1 END, j.score DESC,
+                                      COALESCE(j.published_at, j.discovered_at) DESC, c.job_id LIMIT 1""",
+                         (now, auto_ok)).fetchone()
         if not row:
             return None
-        claimed = db.execute("UPDATE cv_jobs SET status='generating', attempts=attempts+1, updated_at=? "
-                             "WHERE job_id=? AND status='pending'", (now, row['job_id'])).rowcount
+        consume = row['reason'] not in MANUAL_REASONS and row['quota_day'] is None
+        claimed = db.execute("UPDATE cv_jobs SET status='generating', attempts=attempts+1, updated_at=?, "
+                             "quota_day=CASE WHEN ? THEN ? ELSE quota_day END WHERE job_id=? AND status='pending'",
+                             (now, consume, day, row['job_id'])).rowcount
     return row['job_id'] if claimed else None
+
+
+def claim_next_exists():
+    with connect() as db:
+        return bool(db.execute("SELECT 1 FROM cv_jobs WHERE status='pending' LIMIT 1").fetchone())
 
 
 def cv_state(job_id, row=None):
@@ -545,7 +622,18 @@ class CVWorker:
         self.provider_factory = provider_factory
         self.wake = asyncio.Event()
         self.paused_reason = None
+        self._alerted_reason = None
         self._last_request = 0.0
+
+    async def _alert_pause(self, reason):
+        """Critical-failure alert: once per distinct reason (not repeated every poll)."""
+        if reason and reason != self._alerted_reason:
+            self._alerted_reason = reason
+            try:
+                await send_telegram(f'CV generation paused: {reason[:300]}\nFix .env (or the master CV) - '
+                                    'queued jobs are kept and resume automatically.')
+            except Exception:
+                log.exception('Telegram pause alert failed')
 
     def on_new_job(self, job_id, score):
         cfg = settings()
@@ -565,11 +653,13 @@ class CVWorker:
             provider = self.provider_factory()
         except llm.ConfigurationLLMError as exc:
             self.paused_reason = str(exc)
+            if quota_status(cfg)['queued_automatic'] or claim_next_exists():
+                await self._alert_pause(self.paused_reason)
             return False
         wait = self._last_request + cfg['min_interval'] - asyncio.get_running_loop().time()
         if wait > 0:
             await asyncio.sleep(wait)
-        job_id = claim_next()
+        job_id = claim_next(cfg)
         if job_id is None:
             return False
         self._last_request = asyncio.get_running_loop().time()
@@ -579,6 +669,7 @@ class CVWorker:
         except (llm.ConfigurationLLMError, PipelineError) as exc:
             self.paused_reason = str(exc)
             log.error('CV worker paused for %ss: %s', cfg['config_pause'], exc)
+            await self._alert_pause(self.paused_reason)
             await self._sleep(cfg['config_pause'])
         return True
 
@@ -597,6 +688,7 @@ class CVWorker:
                 backfill()
                 while await self.run_once():
                     pass
+                await send_cv_digest()  # one message per batch, never one per CV
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -658,7 +750,11 @@ def main(argv=None):
         print(f'Job {args.job_id}: {enqueue(args.job_id, "manual", force=args.force)}'
               ' (the running service picks it up within CV_WORKER_POLL_SECONDS, or use --run-once)')
     if args.run_once:
-        processed = asyncio.run(CVWorker().run_once())
+        async def once():
+            done = await CVWorker().run_once()
+            await send_cv_digest()
+            return done
+        processed = asyncio.run(once())
         print('Processed one job.' if processed else 'Nothing due (or worker not configured).')
     if args.status or not (args.check or args.job_id is not None or args.run_once):
         print_status()

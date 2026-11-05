@@ -270,7 +270,9 @@ class PipelineTests(unittest.TestCase):
     def claim_and_process(self, provider):
         job_id = cv_pipeline.claim_next()
         self.assertIsNotNone(job_id)
-        return job_id, run(cv_pipeline.process(job_id, provider))
+        status = run(cv_pipeline.process(job_id, provider))
+        run(cv_pipeline.send_cv_digest())  # the worker sends one digest after each batch
+        return job_id, status
 
     # --- happy path, integrity, privacy
 
@@ -604,6 +606,162 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(state['cv_status'], 'failed')
         self.assertIn('validation', state['cv_error'])
         self.assertEqual(cv_pipeline.enqueue(self.job, 'manual'), 'pending')  # retry allowed for failed
+
+
+class DailyLimitAndDigestTests(unittest.TestCase):
+    """CV_DAILY_LIMIT quota and consolidated Telegram digests (reuses the PipelineTests fixtures, not its tests)."""
+    add_job = PipelineTests.add_job
+    claim_and_process = PipelineTests.claim_and_process
+
+    def setUp(self):
+        PipelineTests.setUp(self)
+        self.day = '2026-11-05'
+        for patcher in (mock.patch.object(cv_pipeline, 'local_day', lambda cfg=None: self.day),
+                        mock.patch.dict(os.environ, {'CV_DAILY_LIMIT': '2'})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def claim_all(self):
+        claimed = []
+        while (job_id := cv_pipeline.claim_next()) is not None:
+            claimed.append(job_id)
+            core.set_cv_job(job_id, 'ready')  # simulate completion
+        return claimed
+
+    def test_limit_per_day_priority_and_carry_over(self):
+        low, mid, high = self.add_job(score=72), self.add_job(score=85), self.add_job(score=95)
+        for j in (self.job, low, mid, high):   # self.job has score 80
+            cv_pipeline.enqueue(j, 'new')
+        self.assertEqual(self.claim_all(), [high, mid])
+        self.assertEqual(cv_pipeline.quota_status()['used_today'], 2)
+        self.assertEqual(cv_pipeline.quota_status()['queued_automatic'], 2)
+        self.assertEqual(self.claim_all(), [])                    # limit reached: the rest stays queued
+        self.day = '2026-11-06'
+        self.assertEqual(len(self.claim_all()), 2)                # next day: next two, highest score first
+        self.assertEqual(cv_pipeline.quota_status()['queued_automatic'], 0)
+
+    def test_newer_posting_wins_on_equal_score(self):
+        older, newer = self.add_job(score=90), self.add_job(score=90)
+        with core.connect() as db:
+            db.execute("UPDATE jobs SET published_at='2026-10-01T00:00:00+00:00' WHERE id=?", (older,))
+            db.execute("UPDATE jobs SET published_at='2026-11-04T00:00:00+00:00' WHERE id=?", (newer,))
+        cv_pipeline.enqueue(older, 'new')
+        cv_pipeline.enqueue(newer, 'new')
+        self.assertEqual(cv_pipeline.claim_next(), newer)
+
+    def test_manual_requests_bypass_and_do_not_consume_the_quota(self):
+        a, b = self.add_job(score=90), self.add_job(score=85)
+        cv_pipeline.enqueue(a, 'new')
+        cv_pipeline.enqueue(b, 'new')
+        self.claim_all()
+        manual = self.add_job(score=40)
+        cv_pipeline.CVWorker().request(manual)
+        self.assertEqual(cv_pipeline.claim_next(), manual)        # served although the automatic quota is used up
+        self.assertEqual(cv_pipeline.quota_status()['used_today'], 2)
+        self.assertIsNone(core.get_cv_job(manual)['quota_day'])
+
+    def test_retries_never_consume_a_second_slot(self):
+        cv_pipeline.enqueue(self.job, 'new')
+        temp = llm.TemporaryLLMError('HTTP 503 UNAVAILABLE')
+        self.claim_and_process(FakeProvider(temp))
+        self.assertEqual(cv_pipeline.quota_status()['used_today'], 1)
+        self.day = '2026-11-06'                                   # retry happens the next day
+        with core.connect() as db:
+            db.execute('UPDATE cv_jobs SET next_attempt_at=NULL')
+        _, status = self.claim_and_process(FakeProvider(good_reply))
+        self.assertEqual(status, 'ready')
+        self.assertEqual(cv_pipeline.quota_status()['used_today'], 0)  # charged to the first day only
+        self.assertEqual(core.get_cv_job(self.job)['quota_day'], '2026-11-05')
+
+    def test_configuration_error_refunds_the_slot(self):
+        cv_pipeline.enqueue(self.job, 'new')
+        worker = cv_pipeline.CVWorker(lambda: FakeProvider(llm.ConfigurationLLMError('HTTP 401: API key not valid')))
+        with mock.patch.object(worker, '_sleep', mock.AsyncMock()):
+            run(worker.run_once())
+        row = core.get_cv_job(self.job)
+        self.assertEqual((row['status'], row['quota_day']), ('pending', None))
+        self.assertEqual(cv_pipeline.quota_status()['used_today'], 0)
+
+    def test_quota_is_persistent_across_worker_restarts(self):
+        for j in (self.job, self.add_job(score=91)):
+            cv_pipeline.enqueue(j, 'new')
+        self.claim_all()
+        later = self.add_job(score=99)
+        cv_pipeline.enqueue(later, 'new')
+        cv_pipeline.recover_stale()                               # what a restart does
+        self.assertIsNone(cv_pipeline.claim_next())               # still counted in the database
+
+    def test_completed_cvs_not_requeued_and_unlimited_setting(self):
+        cv_pipeline.enqueue(self.job, 'new')
+        self.claim_all()
+        self.assertEqual(cv_pipeline.enqueue(self.job, 'new'), 'ready')
+        with mock.patch.dict(os.environ, {'CV_DAILY_LIMIT': '-1'}):
+            others = [self.add_job(score=80 + i) for i in range(4)]
+            for j in others:
+                cv_pipeline.enqueue(j, 'new')
+            self.assertEqual(len(self.claim_all()), 4)
+
+    def test_timezone_fallback(self):
+        mock.patch.stopall()  # use the real local_day
+        from datetime import date
+        with mock.patch.dict(os.environ, {'CV_TIMEZONE': 'Not/AZone'}):
+            self.assertEqual(len(cv_pipeline.local_day()), 10)
+        with mock.patch.dict(os.environ, {'CV_TIMEZONE': 'Europe/Amsterdam'}):
+            self.assertRegex(cv_pipeline.local_day(), r'^\d{4}-\d{2}-\d{2}$')
+        self.assertIsInstance(date.fromisoformat(cv_pipeline.local_day()), date)
+
+    def test_one_digest_for_a_batch_and_no_repeat(self):
+        jobs = [self.job, self.add_job(score=91)]
+        with mock.patch.dict(os.environ, {'CV_DAILY_LIMIT': '5'}):
+            for j in jobs:
+                cv_pipeline.enqueue(j, 'new')
+            worker = cv_pipeline.CVWorker(lambda: FakeProvider(good_reply))
+            run(worker.run_once())
+            run(worker.run_once())
+            self.assertEqual(self.sent, [])                       # no message per CV
+            self.assertEqual(run(cv_pipeline.send_cv_digest()), 2)
+            self.assertEqual(len(self.sent), 1)
+            self.assertIn('2 tailored CV(s) ready for review', self.sent[0])
+            self.assertEqual(self.sent[0].count('/api/jobs/'), 2)
+            self.assertEqual(run(cv_pipeline.send_cv_digest()), 0)  # e.g. after a restart: nothing repeated
+
+    def test_failed_digest_send_is_retried(self):
+        cv_pipeline.enqueue(self.job, 'new')
+        cv_pipeline.claim_next()
+        run(cv_pipeline.process(self.job, FakeProvider(good_reply)))
+        with mock.patch.object(cv_pipeline, 'send_telegram', mock.AsyncMock(side_effect=RuntimeError('down'))):
+            self.assertEqual(run(cv_pipeline.send_cv_digest()), 0)
+        self.assertEqual(run(cv_pipeline.send_cv_digest()), 1)
+
+    def test_pause_alert_sent_once(self):
+        cv_pipeline.enqueue(self.job, 'new')
+
+        def factory():
+            raise llm.ConfigurationLLMError('GEMINI_API_KEY is not set in .env')
+        worker = cv_pipeline.CVWorker(factory)
+        run(worker.run_once())
+        run(worker.run_once())
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('CV generation paused', self.sent[0])
+
+
+class CvColumnsMigrationTests(unittest.TestCase):
+    def test_existing_outcomes_are_not_reannounced(self):
+        import sqlite3
+        path = Path(_TMP.name) / 'cv-legacy.sqlite3'
+        db = sqlite3.connect(path)
+        db.executescript("""CREATE TABLE cv_jobs (job_id INTEGER PRIMARY KEY, status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT 'new',
+            attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, last_error TEXT, warnings TEXT, notes TEXT, model TEXT,
+            source TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            INSERT INTO cv_jobs (job_id,status,created_at,updated_at) VALUES (1,'ready','t','t'),(2,'pending','t','t');""")
+        db.commit(), db.close()
+        from app.discovery import store
+        with mock.patch.object(core, 'DB', path), mock.patch.object(store, 'DB', path):
+            core.init_db()
+            db = sqlite3.connect(path)
+            rows = dict(db.execute('SELECT job_id, notified_at FROM cv_jobs').fetchall())
+            db.close()
+        self.assertEqual(rows, {1: 't', 2: None})
 
 
 if __name__ == '__main__':

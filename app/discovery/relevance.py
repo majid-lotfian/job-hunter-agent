@@ -5,7 +5,7 @@ Runs before anything expensive. Tiers:
     secondary  adjacent roles (MLOps, AI platform, data scientist with ML, AI architect, ...)
     possible   unusual title, but the description is strongly AI/ML engineering (kept, low priority)
     none       not relevant (rejected)
-The existing numeric score (core.score_job) is computed separately and unchanged.
+The numeric 0-100 score (core.score_job: title + requirements + seniority/location/language) is separate.
 """
 import re
 from dataclasses import dataclass, field
