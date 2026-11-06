@@ -1,24 +1,38 @@
-# Applicant profile template. Copy to data/applicant_profile.yaml on the VM (data/ is gitignored - never commit it)
-# and fill in YOUR real details. The agent uses ONLY what is written here, and only when verified is true.
-# Nothing is guessed: any required application field or screening question not covered below stops the
-# application and asks you to finish it manually.
+# Applicant profile template. On the VM create data/applicant_profile.yaml (data/ is gitignored - never commit it):
+#   .venv/bin/python -m app.applications.profile --init-from-cv     # draft from your master CV (never overwrites)
+#   .venv/bin/python -m app.applications.profile --check            # validate (prints no personal values)
+# The agent uses ONLY what is written here, and only when verified is true. Nothing is guessed: required form
+# fields or screening questions not covered below are flagged for you in the application review page.
 
 verified: false            # set to true after checking every value below is accurate
 
+full_name: Your Name
 first_name: Your
 last_name: Name
 email: you@example.com
 phone: "+31 6 00000000"
 location: City, Netherlands
+nationality: Dutch
+work_authorization: "EU citizen - no work permit or sponsorship needed in the Netherlands"
 linkedin: https://www.linkedin.com/in/your-profile
+github: https://github.com/your-account
+portfolio: https://your-site.example
+
+preferred_locations: [Amsterdam, Utrecht]
+work_arrangements: [hybrid, remote]        # any of: onsite, hybrid, remote
+languages:                                  # name: level (Native, Fluent, Intermediate, B2, ...)
+  English: Fluent
+  Dutch: Intermediate
+
+salary_expectation: null    # e.g. "EUR 5,500 gross/month" - only used when a form asks for it
+notice_period: null         # e.g. "1 month"
+availability: null          # e.g. "Immediately" or "From 2027-01-01"
 
 # Screening questions you are willing to have answered automatically. Matched case-insensitively to the
-# question text (exact `question`, or a regular expression in `match`). Boolean questions need true/false,
-# choice questions must use one of the employer's options exactly.
+# question text (exact `question`, or a regular expression in `match`). Boolean questions need true/false
+# (mapped onto Yes/No options); choice questions must use one of the employer's options exactly.
 answers:
-  - question: "Do you live in the Netherlands?"
+  - match: "authori[sz]ed to work|right to work|work permit"
     answer: true
-  - match: "work permit|right to work|authori[sz]ed to work"
-    answer: true
-  - match: "visa sponsorship|require sponsorship"
+  - match: "(require|need).{0,30}sponsorship|visa sponsorship"
     answer: false

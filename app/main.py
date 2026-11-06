@@ -13,6 +13,10 @@ from pydantic import BaseModel
 from . import auth, cv_pipeline, workflow
 from .applications import ApplicationWorker
 from .core import connect, init_db, discover, get_job, cv_path, transition, log
+import json  # noqa: E402  (kept below line 15: the VM keeps a local edit at the top of this file)
+from datetime import datetime, timezone  # noqa: E402
+from . import applications  # noqa: E402
+from .applications import page as application_page_mod  # noqa: E402
 
 auth.install_log_redaction()
 
@@ -229,6 +233,76 @@ def change_status(job_id: int, payload: StatusChange):
     return {'ok': True}
 
 
+# --------------------------------------------------------------------------- supervised applications
+
+def _application(app_id):
+    with connect() as db:
+        app_row = applications._app_row(db, app_id)
+    if app_row is None:
+        raise HTTPException(404, 'Unknown application')
+    return app_row
+
+
+@app.get('/applications/{app_id}', response_class=HTMLResponse)
+def application_page(app_id: int, request: Request):
+    """Review page: CV, employer form fields with your values, missing information, actions."""
+    if not auth.is_authenticated(request):
+        return login_redirect(request)
+    app_row = _application(app_id)
+    package = json.loads(app_row['detail'] or '{}').get('package') or {}
+    actions = application_page_mod.allowed_actions(app_row, applications.is_prepared(app_row))
+    return HTMLResponse(application_page_mod.render(app_row, package, actions), headers=NO_STORE)
+
+
+@app.get('/applications/{app_id}/open')
+def open_application_page(app_id: int, request: Request):
+    """Logs that you opened the employer's page, then sends you there (http/https only)."""
+    if not auth.is_authenticated(request):
+        return login_redirect(request)
+    app_row = _application(app_id)
+    package = json.loads(app_row['detail'] or '{}').get('package') or {}
+    target = package.get('apply_page') or app_row['apply_url']
+    if not target or not target.lower().startswith(('https://', 'http://')):
+        raise HTTPException(409, 'No application page known for this job')
+    with connect() as db:
+        db.execute('INSERT INTO events (job_id, action, note, created_at) VALUES (?,?,?,?)',
+                   (app_row['job_id'], 'application_page_opened', 'dashboard', datetime.now(timezone.utc).isoformat()))
+    return RedirectResponse(target, status_code=303, headers=NO_STORE)
+
+
+class SubmittedPayload(BaseModel):
+    confirmation: str = ''
+    confirmed: bool = False
+
+
+@app.post('/api/applications/{app_id}/submitted', dependencies=[Depends(auth.require_api_session)])
+def application_submitted(app_id: int, payload: SubmittedPayload):
+    _application(app_id)
+    try:
+        return {'status': applications.mark_submitted(app_id, payload.confirmation, confirmed=payload.confirmed)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post('/api/applications/{app_id}/cancel', dependencies=[Depends(auth.require_api_session)])
+def application_cancel(app_id: int):
+    _application(app_id)
+    try:
+        return {'status': applications.cancel(app_id)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post('/api/applications/{app_id}/refresh', dependencies=[Depends(auth.require_api_session)])
+async def application_refresh(app_id: int):
+    _application(app_id)
+    try:
+        package = await applications.refresh_package(app_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {'ready': package['ready'], 'missing': len(package['missing']), 'questions': len(package['questions'])}
+
+
 @app.get('/api/jobs/{job_id}/cv.pdf')
 def cv_pdf(job_id: int, request: Request):
     """Download the PDF of the tailored CV (only if it matches the current HTML CV)."""
@@ -299,7 +373,7 @@ DASHBOARD_HTML = '''<!doctype html><html lang="en"><head><meta charset="utf-8"><
 const notice=s=>document.getElementById('notice').textContent=s;
 async function request(path,options={}){const r=await fetch(path,{...options,credentials:'same-origin',headers:{'Content-Type':'application/json',...(options.headers||{})}});if(r.status===401){location.href='/login';throw new Error('Session expired')}if(!r.ok)throw new Error(await r.text());return r.json()}
 async function loadHealth(){try{const h=await request('/api/discovery/health');const body=document.getElementById('sources');body.replaceChildren();let bad=0;for(const s of h.sources){if(['failed','rate_limited'].includes(s.status))bad++;const tr=document.createElement('tr');for(const v of [s.source_key,s.status,(s.last_success_at||'never').slice(0,16).replace('T',' '),s.fetched,s.accepted,s.new_unique,s.duplicates,s.errors,s.last_error||'']){const td=document.createElement('td');td.textContent=v??'';tr.append(td)}body.append(tr)}const r=h.last_run;document.getElementById('health-summary').textContent='Sources: '+h.sources.length+' tracked, '+bad+' failing'+(r?' — last scan '+r.finished_at.slice(0,16).replace('T',' ')+' UTC: '+r.fetched+' checked, '+r.new_unique+' new, '+r.duplicates+' duplicates merged':'')}catch(e){}}
-async function loadJobs(){loadHealth();try{const data=await request('/api/jobs'+(document.getElementById('inactive').checked?'?include_inactive=true':''));const body=document.getElementById('jobs');body.replaceChildren();for(const j of data){const tr=document.createElement('tr');const cell=()=>{const td=document.createElement('td');tr.append(td);return td};const name=cell();const link=document.createElement('a');link.href=j.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent=j.title;const tier=document.createElement('span');tier.className='tier '+(j.relevance_tier||'');tier.textContent=j.relevance_tier||'';name.append(link,tier,document.createElement('br'),document.createTextNode(j.employer||j.company));if(j.language_req&&j.language_req.startsWith('dutch')){const l=document.createElement('small');l.className='warn';l.textContent=' · '+j.language_req.replace('_',' ');name.append(l)}const via=document.createElement('small');via.textContent='via '+j.sources.map(s=>s.source).join(', ')+(j.availability!=='active'?' · '+j.availability:'');name.append(document.createElement('br'),via);const wf=document.createElement('small');wf.textContent=' · '+(j.workflow||'')+(j.ai_keywords&&j.ai_keywords.length?' · AI: '+j.ai_keywords.join(', '):'')+(j.application_status?' · application: '+j.application_status.replace(/_/g,' '):'');name.append(wf);if(j.application_detail&&j.application_detail.reason){const r=document.createElement('small');r.className='warn';r.textContent=' · '+j.application_detail.reason;name.append(document.createElement('br'),r)}const ap=document.createElement('a');ap.href=j.apply_url||j.url;ap.target='_blank';ap.rel='noopener noreferrer';ap.textContent=' apply ↗';name.append(ap);const loc=cell();loc.textContent=j.location_label||j.location||'—';if(j.location_region==='nl_other'){const o=document.createElement('small');o.textContent=' (outside Randstad)';loc.append(o)}cell().textContent=j.score+'/100';cell().textContent=j.status;const cvCell=cell();cvCell.textContent=j.cv_status.replace('_',' ');const detail=j.cv_error||j.cv_warnings.join(' | ');if(detail){const s=document.createElement('small');s.textContent=detail.slice(0,300);cvCell.append(document.createElement('br'),s)}const actions=cell();if(j.cv_has_file){const cv=document.createElement('button');cv.textContent='HTML CV';cv.onclick=()=>window.open('/api/jobs/'+j.id+'/cv','_blank','noopener');actions.append(cv)}if(j.cv_has_pdf){const pd=document.createElement('a');pd.href='/api/jobs/'+j.id+'/cv.pdf';pd.textContent=' PDF ⤓';pd.setAttribute('download','');actions.append(pd)}else if(['ready','needs_review'].includes(j.cv_status)){const rp=document.createElement('button');rp.textContent=j.cv_pdf_status==='failed'?'Retry PDF':'Make PDF';rp.style.margin='3px';rp.title=j.cv_pdf_error||'';rp.onclick=async()=>{try{const r=await request('/api/jobs/'+j.id+'/cv/pdf',{method:'POST'});notice('PDF '+r.pdf_status);loadJobs()}catch(e){notice(e.message)}};actions.append(rp)}if(['none','legacy','failed','waiting_retry'].includes(j.cv_status)){const g=document.createElement('button');g.textContent=j.cv_status==='failed'?'Retry CV':(j.cv_status==='waiting_retry'?'Retry now':'Generate CV');g.style.margin='3px';g.onclick=async()=>{try{const r=await request('/api/jobs/'+j.id+'/cv/generate',{method:'POST'});notice('CV '+r.cv_status);loadJobs()}catch(e){notice(e.message)}};actions.append(g)}const labels={approve_apply:'Approve & Apply',approve_cv_apply:'Approve CV & Apply',reject:'Reject'};for(const a of (j.actions||[])){const d=document.createElement('button');d.textContent=labels[a];d.style.margin='3px';if(a==='reject')d.style.background='#8a1c1c';d.onclick=async()=>{if(a!=='reject'&&!confirm(labels[a]+': '+j.title+'?\n'+(a==='approve_apply'?'Submits the current CV version (if automatic submission is enabled).':'Generates and validates the CV, then applies - no second approval.')))return;try{const r=await request('/api/jobs/'+j.id+'/decision',{method:'POST',body:JSON.stringify({action:a,token:j.token})});notice(r.message);loadJobs()}catch(e){notice(e.message)}};actions.append(d)}for(const status of ['needs_revision','applied','interview','closed']){const b=document.createElement('button');b.textContent=status.replace('_',' ');b.style.margin='3px';b.onclick=async()=>{let note='';if(status==='applied'){note=prompt('Enter submission confirmation/reference (required):')||'';if(!note.trim())return notice('Confirmation is required to record applied')}try{await request('/api/jobs/'+j.id+'/status',{method:'POST',body:JSON.stringify({status,note})});loadJobs()}catch(e){notice(e.message)}};actions.append(b)}body.append(tr)}let msg='Loaded '+data.length+' jobs';try{const w=await request('/api/cv-worker');if(w.quota)msg+=' — automatic CVs today: '+w.quota.used_today+'/'+(w.quota.daily_limit<0?'∞':w.quota.daily_limit)+(w.quota.queued_automatic?', '+w.quota.queued_automatic+' queued':'');if(w.paused_reason)msg+=' — CV generation paused: '+w.paused_reason}catch(e){}notice(msg)}catch(e){notice(e.message)}}
+async function loadJobs(){loadHealth();try{const data=await request('/api/jobs'+(document.getElementById('inactive').checked?'?include_inactive=true':''));const body=document.getElementById('jobs');body.replaceChildren();for(const j of data){const tr=document.createElement('tr');const cell=()=>{const td=document.createElement('td');tr.append(td);return td};const name=cell();const link=document.createElement('a');link.href=j.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent=j.title;const tier=document.createElement('span');tier.className='tier '+(j.relevance_tier||'');tier.textContent=j.relevance_tier||'';name.append(link,tier,document.createElement('br'),document.createTextNode(j.employer||j.company));if(j.language_req&&j.language_req.startsWith('dutch')){const l=document.createElement('small');l.className='warn';l.textContent=' · '+j.language_req.replace('_',' ');name.append(l)}const via=document.createElement('small');via.textContent='via '+j.sources.map(s=>s.source).join(', ')+(j.availability!=='active'?' · '+j.availability:'');name.append(document.createElement('br'),via);const wf=document.createElement('small');wf.textContent=' · '+(j.workflow||'')+(j.ai_keywords&&j.ai_keywords.length?' · AI: '+j.ai_keywords.join(', '):'')+(j.application_status?' · application: '+j.application_status.replace(/_/g,' '):'');name.append(wf);if(j.application_detail&&j.application_detail.reason){const r=document.createElement('small');r.className='warn';r.textContent=' · '+j.application_detail.reason;name.append(document.createElement('br'),r)}const ap=document.createElement('a');ap.href=j.apply_url||j.url;ap.target='_blank';ap.rel='noopener noreferrer';ap.textContent=' apply ↗';name.append(ap);const loc=cell();loc.textContent=j.location_label||j.location||'—';if(j.location_region==='nl_other'){const o=document.createElement('small');o.textContent=' (outside Randstad)';loc.append(o)}cell().textContent=j.score+'/100';cell().textContent=j.status;const cvCell=cell();cvCell.textContent=j.cv_status.replace('_',' ');const detail=j.cv_error||j.cv_warnings.join(' | ');if(detail){const s=document.createElement('small');s.textContent=detail.slice(0,300);cvCell.append(document.createElement('br'),s)}const actions=cell();if(j.cv_has_file){const cv=document.createElement('button');cv.textContent='HTML CV';cv.onclick=()=>window.open('/api/jobs/'+j.id+'/cv','_blank','noopener');actions.append(cv)}if(j.cv_has_pdf){const pd=document.createElement('a');pd.href='/api/jobs/'+j.id+'/cv.pdf';pd.textContent=' PDF ⤓';pd.setAttribute('download','');actions.append(pd)}else if(['ready','needs_review'].includes(j.cv_status)){const rp=document.createElement('button');rp.textContent=j.cv_pdf_status==='failed'?'Retry PDF':'Make PDF';rp.style.margin='3px';rp.title=j.cv_pdf_error||'';rp.onclick=async()=>{try{const r=await request('/api/jobs/'+j.id+'/cv/pdf',{method:'POST'});notice('PDF '+r.pdf_status);loadJobs()}catch(e){notice(e.message)}};actions.append(rp)}if(['none','legacy','failed','waiting_retry'].includes(j.cv_status)){const g=document.createElement('button');g.textContent=j.cv_status==='failed'?'Retry CV':(j.cv_status==='waiting_retry'?'Retry now':'Generate CV');g.style.margin='3px';g.onclick=async()=>{try{const r=await request('/api/jobs/'+j.id+'/cv/generate',{method:'POST'});notice('CV '+r.cv_status);loadJobs()}catch(e){notice(e.message)}};actions.append(g)}const labels=j.action_labels||{approve_apply:'Approve & Apply',approve_cv_apply:'Approve CV & Apply',reject:'Reject'};for(const a of (j.actions||[])){const d=document.createElement('button');d.textContent=labels[a];d.style.margin='3px';if(a==='reject')d.style.background='#8a1c1c';d.onclick=async()=>{if(a!=='reject'&&!confirm(labels[a]+': '+j.title+'?\n'+(labels[a].startsWith('Prepare')?'Checks the vacancy and assembles the CV PDF and form answers for your review. Nothing is submitted.':(a==='approve_apply'?'Submits the current CV version (if automatic submission is enabled).':'Generates and validates the CV, then applies - no second approval.'))))return;try{const r=await request('/api/jobs/'+j.id+'/decision',{method:'POST',body:JSON.stringify({action:a,token:j.token})});notice(r.message);loadJobs()}catch(e){notice(e.message)}};actions.append(d)}if(j.application_id&&!['cancelled'].includes(j.application_status)){const rv=document.createElement('a');rv.href='/applications/'+j.application_id;rv.textContent=' Review Application';rv.style.margin='3px';actions.append(rv);const sm=(j.application_detail&&j.application_detail.summary)||null;if(j.application_detail&&j.application_detail.prepared&&['manual_action_required','dry_run'].includes(j.application_status)){const op=document.createElement('a');op.href='/applications/'+j.application_id+'/open';op.target='_blank';op.rel='noopener';op.textContent=' Open Application Page ↗';op.style.margin='3px';actions.append(op);if(sm&&(sm.missing||sm.questions)){const w=document.createElement('small');w.className='warn';w.textContent=' needs input: '+sm.missing+' missing, '+sm.questions+' question(s)';actions.append(w)}}}for(const status of ['needs_revision','applied','interview','closed']){const b=document.createElement('button');b.textContent=status.replace('_',' ');b.style.margin='3px';b.onclick=async()=>{let note='';if(status==='applied'){note=prompt('Enter submission confirmation/reference (required):')||'';if(!note.trim())return notice('Confirmation is required to record applied')}try{await request('/api/jobs/'+j.id+'/status',{method:'POST',body:JSON.stringify({status,note})});loadJobs()}catch(e){notice(e.message)}};actions.append(b)}body.append(tr)}let msg='Loaded '+data.length+' jobs';try{const w=await request('/api/cv-worker');if(w.quota)msg+=' — automatic CVs today: '+w.quota.used_today+'/'+(w.quota.daily_limit<0?'∞':w.quota.daily_limit)+(w.quota.queued_automatic?', '+w.quota.queued_automatic+' queued':'');if(w.paused_reason)msg+=' — CV generation paused: '+w.paused_reason}catch(e){}notice(msg)}catch(e){notice(e.message)}}
 async function scan(){notice('Scanning…');try{const r=await request('/api/scan',{method:'POST'});notice('Checked '+r.checked+' jobs, added '+r.new);await loadJobs()}catch(e){notice(e.message)}}
 loadJobs();
 </script></body></html>'''

@@ -1007,7 +1007,7 @@ class DailyLimitAndDigestTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 2)                                # one actionable message per ready CV
         self.assertIn('ready for review', self.sent[0])
         labels = [b['text'] for b in markups[0]['inline_keyboard'][0]]
-        self.assertEqual(labels, ['Approve & Apply', 'Reject'])
+        self.assertEqual(labels, ['Prepare Application', 'Reject'])
         self.sent.clear()
         run(workflow.send_pending_actions(sender=send))                    # e.g. after a restart: not repeated
         self.assertEqual(self.sent, [])
