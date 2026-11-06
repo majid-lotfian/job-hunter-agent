@@ -166,35 +166,64 @@ def _group(page, label):
     return None
 
 
-def _attach_file(page, label, cv_path):
-    """Attach the CV to the upload field named `label` and verify it is attached.
-
-    The label can name the file input itself or a wrapper (Greenhouse: role=group labelled "Resume/CV" around a
-    hidden input labelled "Attach"). Widgets that keep the file in their own state clear the input afterwards and show
-    the file name instead, so either a selected file or the file name inside that upload field counts as attached."""
+def _file_target(page, label):
+    """(group, file input) for an upload field: the labelled input itself, the file input inside a labelled wrapper
+    (Greenhouse: role=group "Resume/CV" around a hidden input labelled "Attach"), else the form's first file input."""
     labelled = page.get_by_label(label, exact=False)
-    group = None
     if labelled.count() and labelled.first.get_attribute('type') == 'file':
-        target = labelled.first
-    elif labelled.count() and labelled.first.locator('input[type="file"]').count():
-        group, target = labelled.first, labelled.first.locator('input[type="file"]').first
-    elif page.locator('input[type="file"]').count():
-        target = page.locator('input[type="file"]').first    # fall back to the form's first file input (the resume)
-    else:
-        return False
-    target.set_input_files(str(cv_path))
-    page.wait_for_timeout(1500)
+        return None, labelled.first
+    if labelled.count() and labelled.first.locator('input[type="file"]').count():
+        return labelled.first, labelled.first.locator('input[type="file"]').first
+    if page.locator('input[type="file"]').count():
+        return None, page.locator('input[type="file"]').first
+    return None, None
+
+
+def _file_attached(page, label, cv_path):
+    """Widgets that keep the file in their own state clear (or remove) the input and show the file name instead, so
+    either a selected file or the file name inside that upload field counts as attached. The field is located by its
+    label every time - never by "first file input" once a labelled field exists (Greenhouse removes the resume's
+    input after an upload, and the next file input on the page is the cover letter's)."""
+    name = Path(cv_path).name
+    labelled = page.get_by_label(label, exact=False)
     try:
-        if target.evaluate('el => el.files.length', timeout=3000) == 1:
+        if labelled.count():
+            el = labelled.first
+            if el.get_attribute('type') == 'file':
+                if el.evaluate('el => el.files.length', timeout=3000) == 1:
+                    return True
+                group = el.locator('xpath=ancestor::*[@role="group" or contains(@class, "upload")][1]')
+                return group.count() > 0 and name in group.inner_text(timeout=3000)
+            inputs = el.locator('input[type="file"]')
+            if inputs.count() and inputs.first.evaluate('el => el.files.length', timeout=3000) == 1:
+                return True
+            return name in el.inner_text(timeout=3000)
+        target = page.locator('input[type="file"]').first      # unlabelled form: its first file input
+        if target.count() and target.evaluate('el => el.files.length', timeout=3000) == 1:
             return True
-    except Exception:
-        pass                                                  # input re-rendered by the widget
-    if group is None:
         group = target.locator('xpath=ancestor::*[@role="group" or contains(@class, "upload")][1]')
-    try:
-        return group.count() > 0 and Path(cv_path).name in group.inner_text(timeout=3000)
+        return group.count() > 0 and name in group.inner_text(timeout=3000)
     except Exception:
         return False
+
+
+def _attach_file(page, label, cv_path):
+    """Attach the CV to the upload field named `label` and verify it is attached."""
+    _, target = _file_target(page, label)
+    if target is None:
+        return False
+    for attempt in range(2):        # a widget that was not ready ignores the file; setting it again is harmless
+        target.set_input_files(str(cv_path))
+        page.wait_for_timeout(1500)
+        if _file_attached(page, label, cv_path):
+            return True
+        page.wait_for_timeout(2000)
+        if _file_attached(page, label, cv_path):
+            return True
+        _, target = _file_target(page, label)
+        if target is None:
+            return False
+    return False
 
 
 def _choose_in_combobox(page, box, wanted):
@@ -275,6 +304,66 @@ def fill_field(page, field, cv_path):
     return target.first.input_value().strip() == str(value).strip()
 
 
+def verify_field(page, field, cv_path):
+    """Read a field's CURRENT state without changing it: is the package value still in the form? Used right before
+    Submit, because scripts on the page (e.g. Greenhouse's resume autofill) can overwrite fields after they were filled."""
+    label, kind, value = field['label'], field.get('kind', 'text'), field.get('value')
+    try:
+        if kind == 'file':
+            return _file_attached(page, label, cv_path)
+        if kind in ('boolean', 'single_choice', 'multi_choice'):
+            wanted = [_as_yes_no(value)] if kind == 'boolean' else [(str(v),) for v in (value if isinstance(value, list) else [value])]
+            el = page.get_by_label(label, exact=False)
+            if el.count() and el.first.evaluate('el => el.tagName') == 'SELECT':
+                chosen = el.first.evaluate('el => el.selectedIndex >= 0 ? el.options[el.selectedIndex].text : ""').strip().lower()
+                return chosen in {w.lower() for w in wanted[0]}
+            if el.count() and el.first.get_attribute('role') == 'combobox':
+                control = el.first.locator('xpath=ancestor::*[contains(@class, "control")][1]')
+                shown = (control.inner_text() if control.count() else el.first.locator('xpath=../..').inner_text()).lower()
+                return all(any(n.lower() in shown for n in names) for names in wanted)
+            group = _group(page, label)
+            if group is None:
+                if kind == 'boolean' and el.count() and el.first.get_attribute('type') == 'checkbox':
+                    return el.first.is_checked() == (wanted[0] is YES)
+                return False
+            for names in wanted:
+                hits = [group.get_by_label(re.compile(rf'^\s*{re.escape(n)}\s*$', re.I)) for n in names]
+                if not any(h.count() and h.first.is_checked() for h in hits):
+                    return False
+            return True
+        target = page.get_by_label(label, exact=False)
+        return bool(target.count()) and target.first.input_value().strip() == str(value).strip()
+    except Exception:
+        return False
+
+
+TEXT_INPUTS_JS = """() => [...document.querySelectorAll('input, textarea')].filter(e =>
+    ['text', 'email', 'tel', 'url', ''].includes((e.getAttribute('type') || '').toLowerCase()) || e.tagName === 'TEXTAREA')
+  .filter(e => e.getAttribute('role') !== 'combobox' && e.type !== 'hidden' && e.id)
+  .map(e => { const l = document.querySelector(`label[for="${CSS.escape(e.id)}"]`);
+              return [e.id, (l ? l.innerText : e.getAttribute('aria-label') || '').trim(), e.value || '']; })"""
+
+
+def clear_unrequested_values(page, fields, empty_at_load):
+    """Text fields that were empty when the page loaded, are not part of the package, and now hold a value (filled
+    by the page's own autofill) are emptied again: only package values are sent. Returns their labels."""
+    def norm(text):
+        return re.sub(r'\s+', ' ', (text or '').replace('*', '')).strip().lower()
+    ours = {norm(f['label']) for f in fields}
+    cleared = []
+    for el_id, label, value in page.evaluate(TEXT_INPUTS_JS):
+        if el_id in empty_at_load and value.strip() and norm(label) not in ours:
+            page.locator(f'[id="{el_id}"]').fill('')
+            cleared.append(label or el_id)
+    return cleared
+
+
+ERROR_TEXT = re.compile(r'(is required|required field|this field is required|please (enter|fill|complete|select|provide)|'
+                        r'is not valid|invalid (email|phone|format)|must be)', re.I)
+ERRORS_JS = """() => [...document.querySelectorAll('body *')].filter(e => e.children.length === 0 && e.offsetParent !== null)
+  .map(e => (e.innerText || '').trim()).filter(t => t && t.length < 160)"""
+
+
 def validation_errors(page):
     texts = []
     for loc in (page.locator('[aria-invalid="true"]:visible'), page.locator('.error:visible, .field-error:visible, [role="alert"]:visible')):
@@ -282,7 +371,11 @@ def validation_errors(page):
             text = (el.inner_text() or el.get_attribute('name') or '').strip()
             if text:
                 texts.append(text[:120])
-    return texts
+    try:
+        texts += [t[:120] for t in page.evaluate(ERRORS_JS) if ERROR_TEXT.search(t)][:5]
+    except Exception:
+        pass
+    return list(dict.fromkeys(texts))
 
 
 def confirmation(page, rules):
@@ -312,18 +405,48 @@ def run(package, cv_path, evidence_dir, browser_channel=None, headless=True):
             page = browser.new_page()
             page.set_default_timeout(int(timeouts.get('action', 15)) * 1000)
             page.goto(package['apply_url'], wait_until='domcontentloaded', timeout=int(timeouts.get('page', 45)) * 1000)
-            page.wait_for_timeout(1000)
+            try:   # let the form's scripts finish loading: a file attached earlier is silently ignored (Greenhouse)
+                page.wait_for_load_state('networkidle', timeout=15000)
+            except Exception:
+                pass
+            page.wait_for_timeout(int(timeouts.get('hydrate', 3)) * 1000)
             blocker = detect_blocker(page)
             if blocker:
                 return {**result, 'status': 'blocked', 'reason': blocker}
-            for field in package['fields']:
+            empty_at_load = {i for i, _, v in page.evaluate(TEXT_INPUTS_JS) if not v.strip()}
+            # files first: attaching a CV can trigger the page's resume autofill, which rewrites other fields
+            ordered = [f for f in package['fields'] if f.get('kind') == 'file'] + \
+                      [f for f in package['fields'] if f.get('kind') != 'file']
+            for i, field in enumerate(ordered):
                 try:
                     ok = fill_field(page, field, cv_path)
                 except Exception as exc:   # element missing / not interactable
                     ok, field = False, {**field, 'error': type(exc).__name__}
                 (result['filled'] if ok else result['missing']).append(field['label'])
+                if field.get('kind') == 'file' and (i + 1 == len(ordered) or ordered[i + 1].get('kind') != 'file'):
+                    page.wait_for_timeout(int(timeouts.get('autofill_settle', 4)) * 1000)
             if any(f['label'] in result['missing'] for f in package['fields'] if f.get('required', True)):
                 return {**result, 'status': 'failed', 'reason': 'required fields could not be filled - nothing was submitted'}
+            # final check of the whole form right before Submit; one re-fill for fields the page changed afterwards
+            page.wait_for_timeout(2000)
+            result['cleared'] = clear_unrequested_values(page, package['fields'], empty_at_load)
+            filled = [f for f in package['fields'] if f['label'] in result['filled']]
+            changed = [f for f in filled if not verify_field(page, f, cv_path)]
+            if changed:
+                result['refilled'] = [f['label'] for f in changed]
+                for f in changed:
+                    try:
+                        fill_field(page, f, cv_path)
+                    except Exception:
+                        pass
+                page.wait_for_timeout(2000)
+                result['cleared'] += clear_unrequested_values(page, package['fields'], empty_at_load)
+            not_ok = [f['label'] for f in filled if not verify_field(page, f, cv_path)]
+            if not_ok:
+                return {**result, 'status': 'failed', 'missing': not_ok,
+                        'reason': 'fields changed by the page and could not be restored: ' + ', '.join(not_ok)
+                                  + ' - nothing was submitted', 'evidence': _evidence(page, evidence_dir, None)}
+            result['verified_before_submit'] = True
             blocker = detect_blocker(page)
             if blocker:
                 return {**result, 'status': 'blocked', 'reason': blocker}
