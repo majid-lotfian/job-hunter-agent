@@ -740,7 +740,9 @@ class ApiIntegrationTests(unittest.TestCase):
         with core.connect() as db:
             db.execute("UPDATE jobs SET score=90")
             db.execute("UPDATE jobs SET availability='closed' WHERE title='NLP Engineer'")
-        with mock.patch.dict(os.environ, {'CV_MIN_SCORE': '70', 'CV_AUTO_GENERATE': 'true'}):
+        empty = Path(tempfile.mkdtemp())   # never look at the real data/cvs (production CVs would count as existing)
+        with mock.patch.dict(os.environ, {'CV_MIN_SCORE': '70', 'CV_AUTO_GENERATE': 'true'}), \
+                mock.patch.object(cv_pipeline, 'cv_path', lambda i: empty / f'job-{i}.html'):
             self.assertEqual(cv_pipeline.backfill(), 1)
 
 

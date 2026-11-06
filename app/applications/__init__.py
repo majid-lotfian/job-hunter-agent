@@ -10,6 +10,8 @@ Rules:
 - APPLY_MODE: off (default) -> readiness check, then you apply manually; dry_run -> adapter builds the request but
   sends nothing; live -> real submission, only for live-capable adapters listed in APPLY_LIVE_ADAPTERS.
 - A job becomes 'applied' only with an external confirmation id from the employer's system.
+- The CV attachment is the PDF rendered from the current HTML CV (app.pdf). If it is missing, invalid or older than
+  the HTML, nothing is submitted: the application stops for manual action and a new PDF is requested.
 - An application left in 'submitting' by a crash/restart is never retried automatically (outcome unknown).
 """
 import json
@@ -19,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from ..core import connect, cv_path, dashboard_base, log, now_iso, send_telegram, transition
 from ..discovery.http import HttpClient
 from ..discovery.normalize import canonical_url
+from ..pdf import pdf_is_current
 from . import adapters
 from .profile import load_profile
 
@@ -68,9 +71,11 @@ def claim_next():
 
 
 def _cv_bundle(job_id):
+    """Attachment selection: the HTML CV (for review) and its PDF - the PDF only if it is valid and was rendered
+    from exactly the current HTML (a stale or broken PDF is never attached)."""
     html = cv_path(job_id)
     pdf = html.with_suffix('.pdf')
-    return {'html': html if html.is_file() else None, 'pdf': pdf if pdf.is_file() else None}
+    return {'html': html if html.is_file() else None, 'pdf': pdf if pdf_is_current(html, pdf) else None}
 
 
 async def process(app_id, http, cfg=None):
@@ -108,9 +113,16 @@ async def process(app_id, http, cfg=None):
                          (canon, app_id)).fetchone() if canon else None
     if dup:
         return finish('blocked', f"Already applied to this vacancy (job {dup['job_id']}) - duplicate prevented.")
-    # 3. readiness (read-only)
-    adapter = adapters.select_adapter(job)
+    # 3. the CV attachment must be a valid PDF of the approved HTML CV
     profile, cv = load_profile(), _cv_bundle(job['id'])
+    if cv['pdf'] is None:
+        from .. import cv_pipeline
+        cv_pipeline.request_pdf(job['id'])          # the CV worker renders it in its next batch (no Gemini)
+        return finish('manual_action_required', 'CV PDF is missing, invalid or outdated - nothing was submitted. '
+                      'A new PDF was requested; approve again once it is ready.',
+                      detail={'missing': ['CV as PDF'], 'reapprove': True})
+    # 4. readiness (read-only)
+    adapter = adapters.select_adapter(job)
     plan = await adapter.prepare(http, job, profile, cv)
     detail = {'adapter': adapter.name, 'missing': plan.missing, 'fields': plan.fields}
     with connect() as db:
@@ -119,13 +131,13 @@ async def process(app_id, http, cfg=None):
         return _retry_or_fail(app_id, app, job, plan.message, cfg)
     if plan.status in (adapters.MANUAL, adapters.BLOCKED):
         return finish(plan.status, plan.message, detail=detail)
-    # 4. mode gates - nothing leaves the VM unless live mode + live-capable adapter + explicitly allowed
+    # 5. mode gates - nothing leaves the VM unless live mode + live-capable adapter + explicitly allowed
     if cfg['mode'] == 'off':
         return finish('manual_action_required', 'Ready, but automatic submission is not activated (APPLY_MODE=off) - apply manually.',
                       detail=detail)
     if cfg['mode'] == 'dry_run' or not adapter.live_capable or adapter.name not in cfg['live_adapters']:
         return finish('dry_run', f'Dry run OK via {adapter.name} - nothing was submitted. Apply manually.', detail=detail)
-    # 5. live submission
+    # 6. live submission
     result = await adapter.submit(http, job, profile, cv, plan)
     if result.status in (adapters.SUBMITTED, adapters.CONFIRMED) and result.external_id:
         stamp = now_iso()

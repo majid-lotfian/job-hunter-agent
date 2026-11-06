@@ -103,7 +103,10 @@ def init_db():
             db.execute("UPDATE cv_jobs SET notified_at=updated_at WHERE status IN ('ready','needs_review','failed')")
         # Transient-failure recovery state (app/cv_pipeline.py): retry cycle, start of the current transient episode.
         for column, ddl in (('retry_cycle', 'INTEGER NOT NULL DEFAULT 0'), ('transient_since', 'TEXT'),
-                            ('last_error_kind', 'TEXT')):
+                            ('last_error_kind', 'TEXT'),
+                            # PDF copy of the HTML CV (app/pdf.py): pending | ready | failed, retried independently
+                            ('pdf_status', 'TEXT'), ('pdf_error', 'TEXT'), ('pdf_attempts', 'INTEGER NOT NULL DEFAULT 0'),
+                            ('pdf_next_attempt_at', 'TEXT'), ('pdf_info', 'TEXT')):
             if column not in cv_cols:
                 db.execute(f'ALTER TABLE cv_jobs ADD COLUMN {column} {ddl}')
         if 'retry_cycle' not in cv_cols:
@@ -136,7 +139,8 @@ def get_cv_job(job_id):
 def set_cv_job(job_id, status, **fields):
     """Insert or update the cv_jobs row for a job. Unspecified columns keep their value."""
     allowed = {'reason', 'attempts', 'next_attempt_at', 'last_error', 'warnings', 'notes', 'model', 'source',
-               'quota_day', 'notified_at', 'completed_at', 'retry_cycle', 'transient_since', 'last_error_kind'}
+               'quota_day', 'notified_at', 'completed_at', 'retry_cycle', 'transient_since', 'last_error_kind',
+               'pdf_status', 'pdf_error', 'pdf_attempts', 'pdf_next_attempt_at', 'pdf_info'}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f'Unknown cv_jobs fields: {sorted(unknown)}')

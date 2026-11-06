@@ -10,7 +10,10 @@ background worker (started by app.main) then, one job at a time:
      using the master CV as the only source of facts;
   3. restores the original contact data locally, re-uses the master's <head> (and so
      its <style>) byte-for-byte, and validates the result against the master;
-  4. saves data/cvs/job-<id>.html; outcomes are announced in one Telegram CV digest per batch.
+  4. saves data/cvs/job-<id>.html; outcomes are announced in one Telegram CV digest per batch;
+  5. right after, renders data/cvs/job-<id>.pdf from that HTML (app.pdf, no Gemini). A PDF failure never touches
+     the HTML CV or reruns Gemini: it is recorded (cv_jobs.pdf_*, events) and retried on its own with backoff
+     (PDF_MAX_ATTEMPTS, PDF_RETRY_BASE_SECONDS), or on request (dashboard / `python -m app.pdf`).
 
 At most CV_DAILY_LIMIT (default 5) automatic CVs are started per local calendar day (CV_TIMEZONE, default
 Europe/Amsterdam); the rest stay queued for the next days, highest score first. Manual requests do not count.
@@ -50,7 +53,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from bs4 import BeautifulSoup, Comment, NavigableString
 
-from . import llm
+from . import llm, pdf
 from .core import (ROOT, connect, cv_path, dashboard_base, get_cv_job, get_job, init_db, log,
                    now_iso, send_telegram, set_cv_job)
 from .tailor_cv import GENERATOR, MARKER, MASTER, WORKSPACES, validate_draft
@@ -93,6 +96,9 @@ def settings():
         'llm_daily_budget': _env_int('LLM_MAX_REQUESTS_PER_DAY', 250),   # hard stop for Gemini calls; -1 = unlimited
         'rate_limit_cooldown': max(10, _env_int('LLM_RATE_LIMIT_COOLDOWN_SECONDS', 120)),
         'timezone': os.getenv('CV_TIMEZONE', 'Europe/Amsterdam').strip() or 'Europe/Amsterdam',
+        'pdf_auto': os.getenv('PDF_AUTO_GENERATE', 'true').strip().lower() not in ('0', 'false', 'no'),
+        'pdf_max_attempts': max(1, _env_int('PDF_MAX_ATTEMPTS', 3)),
+        'pdf_retry_base': max(10, _env_int('PDF_RETRY_BASE_SECONDS', 300)),
     }
 
 
@@ -581,7 +587,7 @@ async def process(job_id, provider, cfg=None):
         return 'missing'
     path = cv_path(job_id)
     if has_marker(path) and row['reason'] != 'regenerate':
-        set_cv_job(job_id, 'ready', source='existing', last_error=None, next_attempt_at=None)
+        set_cv_job(job_id, 'ready', source='existing', last_error=None, next_attempt_at=None, **PDF_PENDING)
         return 'ready'  # a tailored CV appeared meanwhile (e.g. Claude Code); never overwrite it
     try:
         document, warnings, notes = await generate(job, provider)
@@ -612,9 +618,16 @@ async def process(job_id, provider, cfg=None):
     set_cv_job(job_id, status, source=provider.name, model=provider.model, last_error=None,
                next_attempt_at=None, warnings='\n'.join(warnings) or None, notes=json.dumps(notes),
                completed_at=now_iso(), notified_at=None,  # announced in the next CV digest
-               retry_cycle=0, transient_since=None, last_error_kind=None)
+               retry_cycle=0, transient_since=None, last_error_kind=None, **PDF_PENDING)
     note_model_ok()
     log.info('CV for job %s: %s (%d warning(s))', job_id, status, len(warnings))
+    if cfg['pdf_auto']:
+        # PDF right away, before an approved application is handed over (it attaches the PDF). A failure is only
+        # recorded here; the HTML CV stays ready and the PDF is retried by process_pdfs() without Gemini.
+        try:
+            await asyncio.to_thread(make_pdf, job_id, False, False, cfg)
+        except Exception:
+            log.exception('PDF step failed for job %s', job_id)
     _cv_finished(job_id, status)
     return status
 
@@ -652,6 +665,97 @@ async def _temporary_failure(job, row, provider, exc, cfg):
         log.warning('CV for job %s: temporary %s error on %s (attempt %s/%s), retry in %ss (%s)',
                     job_id, kind, model, row['attempts'], cfg['max_attempts'], delay, exc)
     return status
+
+
+# --------------------------------------------------------------------------- PDF copies (app.pdf)
+
+PDF_PENDING = {'pdf_status': 'pending', 'pdf_error': None, 'pdf_attempts': 0, 'pdf_next_attempt_at': None}
+
+
+def pdf_path(job_id):
+    return cv_path(job_id).with_suffix('.pdf')
+
+
+def pdf_current(job_id):
+    return pdf.pdf_is_current(cv_path(job_id), pdf_path(job_id))
+
+
+def pdf_candidates(include_failed=False, cfg=None):
+    """Completed CVs (with an HTML file) whose PDF should be rendered now. Automatic retries stop after
+    PDF_MAX_ATTEMPTS failures; include_failed (manual/CLI) also returns those."""
+    cfg = cfg or settings()
+    with connect() as db:
+        rows = db.execute("""SELECT job_id, pdf_status, pdf_attempts, pdf_next_attempt_at FROM cv_jobs
+                             WHERE status IN ('ready','needs_review') ORDER BY job_id""").fetchall()
+    now, due = now_iso(), []
+    for r in rows:
+        if not cv_path(r['job_id']).is_file():
+            continue
+        if r['pdf_status'] == 'ready' and pdf_current(r['job_id']):
+            continue                                   # HTML unchanged and PDF valid: nothing to do
+        if r['pdf_status'] == 'failed' and not include_failed and (
+                (r['pdf_attempts'] or 0) >= cfg['pdf_max_attempts'] or (r['pdf_next_attempt_at'] or '') > now):
+            continue
+        due.append(r['job_id'])
+    return due
+
+
+def _set_pdf(job_id, **fields):
+    """Update only the PDF columns - never the CV status (a regeneration may have started meanwhile)."""
+    assert all(k.startswith('pdf_') for k in fields)
+    with connect() as db:
+        db.execute(f"UPDATE cv_jobs SET {', '.join(f'{k}=?' for k in fields)}, updated_at=? WHERE job_id=?",
+                   (*fields.values(), now_iso(), job_id))
+
+
+def _event(job_id, action, note):
+    with connect() as db:
+        db.execute('INSERT INTO events (job_id, action, note, created_at) VALUES (?,?,?,?)', (job_id, action, note[:500], now_iso()))
+
+
+def make_pdf(job_id, force=False, manual=False, cfg=None, runner=None):
+    """Create/refresh the PDF of a job's HTML CV (never calls Gemini). Returns (status, detail).
+    A valid PDF of the current HTML is kept as is unless force=True."""
+    cfg = cfg or settings()
+    row = get_cv_job(job_id)
+    html = cv_path(job_id)
+    if not html.is_file():
+        if row:
+            _set_pdf(job_id, pdf_status='failed', pdf_error='HTML CV missing')
+        return 'failed', 'HTML CV missing'
+    if not force and pdf_current(job_id):
+        info = json.dumps({'bytes': pdf_path(job_id).stat().st_size, **json.loads((row['pdf_info'] if row else None) or '{}')})
+        if row:
+            _set_pdf(job_id, pdf_status='ready', pdf_error=None, pdf_next_attempt_at=None, pdf_info=info)
+        return 'ready', 'already current (kept)'
+    try:
+        info = pdf.render_pdf(html, pdf_path(job_id), runner=runner)
+    except pdf.PdfError as exc:
+        attempts = (row['pdf_attempts'] or 0) + 1 if row else 1
+        retry = None
+        if not manual and attempts < cfg['pdf_max_attempts']:
+            retry = (datetime.now(timezone.utc) + timedelta(seconds=cfg['pdf_retry_base'] * 2 ** (attempts - 1))).isoformat()
+        if row:
+            _set_pdf(job_id, pdf_status='failed', pdf_error=str(exc)[:500], pdf_attempts=attempts, pdf_next_attempt_at=retry)
+        _event(job_id, 'cv_pdf_failed', f'attempt {attempts}: {exc}')
+        log.warning('PDF for job %s failed (attempt %s%s): %s', job_id, attempts,
+                    f', retry after {retry[:16]}' if retry else ', no automatic retry left' if not manual else '', exc)
+        return 'failed', str(exc)
+    summary = {'pages': info['pages'], 'bytes': info['bytes'], 'html_sha256': info['html_sha256'][:12]}
+    if row:
+        _set_pdf(job_id, pdf_status='ready', pdf_error=None, pdf_next_attempt_at=None, pdf_info=json.dumps(summary))
+    _event(job_id, 'cv_pdf_ready', f"{info['pages']} page(s), {info['bytes']} bytes")
+    log.info('PDF for job %s: %s page(s), %s bytes', job_id, info['pages'], info['bytes'])
+    return 'ready', f"{info['pages']} page(s), {info['bytes']} bytes"
+
+
+def request_pdf(job_id):
+    """Manual retry (dashboard): reset the PDF state so the worker renders it in its next batch."""
+    row = get_cv_job(job_id)
+    if not row or row['status'] not in DONE or not cv_path(job_id).is_file():
+        return 'no_cv'
+    _set_pdf(job_id, **PDF_PENDING)
+    return 'pending'
 
 
 def _cv_finished(job_id, status):
@@ -754,7 +858,7 @@ def backfill(cfg=None):
     for row in rows:
         path = cv_path(row['id'])
         if has_marker(path):
-            set_cv_job(row['id'], 'ready', source='existing')
+            set_cv_job(row['id'], 'ready', source='existing', **PDF_PENDING)
             continue
         enqueue(row['id'], 'legacy' if path.exists() else 'new')
         queued += 1
@@ -809,12 +913,15 @@ def cv_state(job_id, row=None):
     path = cv_path(job_id)
     if row is None:
         status = 'legacy' if path.exists() and not has_marker(path) else ('ready' if path.exists() else 'none')
-        return {'cv_status': status, 'cv_error': None, 'cv_warnings': [], 'cv_has_file': path.exists()}
+        return {'cv_status': status, 'cv_error': None, 'cv_warnings': [], 'cv_has_file': path.exists(),
+                'cv_pdf_status': None, 'cv_pdf_error': None, 'cv_has_pdf': False}
     error = row['last_error']
+    pdf_state = {'cv_pdf_status': row['pdf_status'], 'cv_pdf_error': row['pdf_error'],
+                 'cv_has_pdf': row['status'] in DONE and pdf_current(job_id)}
     if row['status'] == 'waiting_retry' and row['next_attempt_at']:
         error = f"{error or 'Temporary error'} — retrying automatically after {row['next_attempt_at'][:16].replace('T', ' ')} UTC"
     return {'cv_status': row['status'], 'cv_error': error, 'next_retry_at': row['next_attempt_at'] if row['status'] in QUEUED else None,
-            'cv_warnings': (row['warnings'] or '').splitlines(), 'cv_has_file': path.exists()}
+            'cv_warnings': (row['warnings'] or '').splitlines(), 'cv_has_file': path.exists(), **pdf_state}
 
 
 # --------------------------------------------------------------------------- worker
@@ -904,9 +1011,24 @@ class CVWorker:
         """Process all due jobs with CV_WORKER_CONCURRENCY parallel slots, then notify once."""
         backfill()
         await asyncio.gather(*(self._drain() for _ in range(settings()['concurrency'])))
+        await self.process_pdfs()
         await send_cv_digest()  # failures only; ready CVs get individual Approve & Apply messages
         from . import workflow
         await workflow.send_pending_actions()
+
+    async def process_pdfs(self):
+        """PDFs for completed CVs, one at a time, off the event loop (blocking child process with a timeout)."""
+        cfg = settings()
+        if not cfg['pdf_auto']:
+            return 0
+        done = 0
+        for job_id in pdf_candidates(cfg=cfg):
+            try:
+                await asyncio.to_thread(make_pdf, job_id, False, False, cfg)
+            except Exception:
+                log.exception('PDF step failed for job %s', job_id)
+            done += 1
+        return done
 
     async def run(self):
         init_db()
