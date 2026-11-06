@@ -245,6 +245,7 @@ async def _notify(cfg, notifier):
         lines = [f'Job discovery: {len(relevant)} new relevant job(s)']
         for j in relevant[:DIGEST_MAX_LINES]:
             cv = {'pending': 'CV queued', 'generating': 'CV generating', 'ready': 'CV ready', 'needs_review': 'CV needs review',
+                  'waiting_retry': 'CV retrying later',
                   'failed': 'CV failed'}.get(j['cv_status'], 'no automatic CV')
             dutch = ' · Dutch required' if j['language_req'] == 'dutch_required' else ''
             lines.append(f"• {j['score']}/100 {j['title']} — {j['employer'] or j['company']} "
