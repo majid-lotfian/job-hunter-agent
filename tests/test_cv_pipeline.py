@@ -16,7 +16,7 @@ import httpx  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import auth, core, cv_pipeline, llm, main  # noqa: E402
+from app import auth, core, cv_pipeline, llm, main, workflow  # noqa: E402
 
 STYLE = 'body{font:11pt Arial}.item{margin:4px}.job{font-weight:bold}'
 MASTER = f'''<!doctype html><html><head><meta charset="utf-8"><title>Jane Doe — Engineer</title>
@@ -246,10 +246,13 @@ class PipelineTests(unittest.TestCase):
         async def fake_send(text, markup=None):
             self.sent.append(text)
             return True
+        self.fake_send = fake_send
+        cv_pipeline._cooldown['until'] = 0
         for patcher in (mock.patch.object(cv_pipeline, 'MASTER', self.master),
                         mock.patch.object(cv_pipeline, 'WORKSPACES', self.tmp / 'tailoring'),
                         mock.patch.object(cv_pipeline, 'cv_path', lambda i: self.cvs / f'job-{i}.html'),
                         mock.patch.object(main, 'cv_path', lambda i: self.cvs / f'job-{i}.html'),
+                        mock.patch.object(workflow, 'cv_path', lambda i: self.cvs / f'job-{i}.html'),
                         mock.patch.object(cv_pipeline, 'send_telegram', fake_send),
                         mock.patch.dict(os.environ, {'CV_MIN_SCORE': '70', 'CV_AUTO_GENERATE': 'true',
                                                      'CV_MAX_ATTEMPTS': '3', 'LLM_MIN_INTERVAL_SECONDS': '0'})):
@@ -271,7 +274,9 @@ class PipelineTests(unittest.TestCase):
         job_id = cv_pipeline.claim_next()
         self.assertIsNotNone(job_id)
         status = run(cv_pipeline.process(job_id, provider))
-        run(cv_pipeline.send_cv_digest())  # the worker sends one digest after each batch
+        run(cv_pipeline.send_cv_digest())  # the worker sends the failure digest after each batch ...
+        run(workflow.send_pending_actions(sender=self.fake_send))  # ... and actionable Approve & Apply messages
+        cv_pipeline._cooldown['until'] = 0  # tests drive retries explicitly
         return job_id, status
 
     # --- happy path, integrity, privacy
@@ -296,7 +301,7 @@ class PipelineTests(unittest.TestCase):
         # Telegram: review link, no submission, no secrets
         self.assertEqual(len(self.sent), 1)
         self.assertIn(f'/api/jobs/{job_id}/cv', self.sent[0])
-        self.assertIn('Nothing has been submitted', self.sent[0])
+        self.assertIn('Nothing is submitted without your approval', self.sent[0])
         self.assertNotIn(os.environ['DASHBOARD_TOKEN'], self.sent[0])
 
     def test_clean_tailoring_is_ready(self):
@@ -710,28 +715,38 @@ class DailyLimitAndDigestTests(unittest.TestCase):
             self.assertRegex(cv_pipeline.local_day(), r'^\d{4}-\d{2}-\d{2}$')
         self.assertIsInstance(date.fromisoformat(cv_pipeline.local_day()), date)
 
-    def test_one_digest_for_a_batch_and_no_repeat(self):
+    def test_ready_cvs_get_individual_approval_messages_once(self):
         jobs = [self.job, self.add_job(score=91)]
-        with mock.patch.dict(os.environ, {'CV_DAILY_LIMIT': '5'}):
-            for j in jobs:
-                cv_pipeline.enqueue(j, 'new')
-            worker = cv_pipeline.CVWorker(lambda: FakeProvider(good_reply))
-            run(worker.run_once())
-            run(worker.run_once())
-            self.assertEqual(self.sent, [])                       # no message per CV
-            self.assertEqual(run(cv_pipeline.send_cv_digest()), 2)
-            self.assertEqual(len(self.sent), 1)
-            self.assertIn('2 tailored CV(s) ready for review', self.sent[0])
-            self.assertEqual(self.sent[0].count('/api/jobs/'), 2)
-            self.assertEqual(run(cv_pipeline.send_cv_digest()), 0)  # e.g. after a restart: nothing repeated
+        for j in jobs:
+            cv_pipeline.enqueue(j, 'new')
+        worker = cv_pipeline.CVWorker(lambda: FakeProvider(good_reply))
+        run(worker.run_once())
+        run(worker.run_once())
+        self.assertEqual(self.sent, [])                                    # nothing during processing
+        self.assertEqual(run(cv_pipeline.send_cv_digest()), 0)             # no failures to report
+        markups = []
 
-    def test_failed_digest_send_is_retried(self):
+        async def send(text, markup=None):
+            self.sent.append(text)
+            markups.append(markup)
+        run(workflow.send_pending_actions(sender=send))
+        self.assertEqual(len(self.sent), 2)                                # one actionable message per ready CV
+        self.assertIn('ready for review', self.sent[0])
+        labels = [b['text'] for b in markups[0]['inline_keyboard'][0]]
+        self.assertEqual(labels, ['Approve & Apply', 'Reject'])
+        self.sent.clear()
+        run(workflow.send_pending_actions(sender=send))                    # e.g. after a restart: not repeated
+        self.assertEqual(self.sent, [])
+
+    def test_failure_digest_retried_when_sending_fails(self):
         cv_pipeline.enqueue(self.job, 'new')
         cv_pipeline.claim_next()
-        run(cv_pipeline.process(self.job, FakeProvider(good_reply)))
+        bad = lambda p: {'body_html': '<p>nothing</p>'}
+        run(cv_pipeline.process(self.job, FakeProvider(bad, bad)))
         with mock.patch.object(cv_pipeline, 'send_telegram', mock.AsyncMock(side_effect=RuntimeError('down'))):
             self.assertEqual(run(cv_pipeline.send_cv_digest()), 0)
         self.assertEqual(run(cv_pipeline.send_cv_digest()), 1)
+        self.assertIn('failed', self.sent[-1])
 
     def test_pause_alert_sent_once(self):
         cv_pipeline.enqueue(self.job, 'new')

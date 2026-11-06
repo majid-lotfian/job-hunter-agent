@@ -1,0 +1,24 @@
+# Applicant profile template. Copy to data/applicant_profile.yaml on the VM (data/ is gitignored - never commit it)
+# and fill in YOUR real details. The agent uses ONLY what is written here, and only when verified is true.
+# Nothing is guessed: any required application field or screening question not covered below stops the
+# application and asks you to finish it manually.
+
+verified: false            # set to true after checking every value below is accurate
+
+first_name: Your
+last_name: Name
+email: you@example.com
+phone: "+31 6 00000000"
+location: City, Netherlands
+linkedin: https://www.linkedin.com/in/your-profile
+
+# Screening questions you are willing to have answered automatically. Matched case-insensitively to the
+# question text (exact `question`, or a regular expression in `match`). Boolean questions need true/false,
+# choice questions must use one of the employer's options exactly.
+answers:
+  - question: "Do you live in the Netherlands?"
+    answer: true
+  - match: "work permit|right to work|authori[sz]ed to work"
+    answer: true
+  - match: "visa sponsorship|require sponsorship"
+    answer: false

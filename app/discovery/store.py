@@ -14,7 +14,7 @@ from .models import AGGREGATOR
 from .normalize import ats_key, canonical_url, employer_key, parse_location, seniority, seniority_label, title_key
 from .relevance import role_tier
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 JOB_COLUMNS = {
     'employer': 'TEXT', 'employer_key': 'TEXT', 'title_key': 'TEXT', 'seniority': 'TEXT', 'seniority_sig': 'TEXT',
     'location_label': 'TEXT', 'location_region': 'TEXT', 'city': 'TEXT', 'country': 'TEXT', 'remote_type': 'TEXT',
@@ -94,7 +94,37 @@ def _migrate_v3(db):
     db.execute('UPDATE jobs SET notified_at=discovered_at WHERE notified_at IS NULL')
 
 
-MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2, 3: _migrate_v3}
+# Application states that block a second application for the same job (duplicate-submission guard).
+LIVE_APPLICATION_STATES = ('awaiting_cv', 'queued', 'submitting', 'submitted', 'confirmed')
+
+
+def _migrate_v4(db):
+    """Approval workflows and application submission: durable, versioned, auditable state."""
+    cols = {r['name'] for r in db.execute('PRAGMA table_info(jobs)')}
+    for column in ('ai_keywords', 'action_notified_at', 'action_version'):
+        if column not in cols:
+            db.execute(f'ALTER TABLE jobs ADD COLUMN {column} TEXT')
+    db.execute('''CREATE TABLE IF NOT EXISTS approvals (
+        id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id), action TEXT NOT NULL,
+        channel TEXT NOT NULL, job_version TEXT NOT NULL, cv_version TEXT, status TEXT NOT NULL DEFAULT 'active',
+        actor TEXT, created_at TEXT NOT NULL, consumed_at TEXT)''')
+    db.execute('CREATE INDEX IF NOT EXISTS approvals_job ON approvals(job_id, status)')
+    db.execute('''CREATE TABLE IF NOT EXISTS applications (
+        id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id), approval_id INTEGER REFERENCES approvals(id),
+        status TEXT NOT NULL, adapter TEXT, mode TEXT, job_version TEXT, cv_version TEXT, apply_url TEXT,
+        canonical_apply_url TEXT, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, external_id TEXT,
+        detail TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, submitted_at TEXT,
+        confirmed_at TEXT, notified_at TEXT)''')
+    states = ','.join(f"'{x}'" for x in LIVE_APPLICATION_STATES)
+    db.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS applications_one_live ON applications(job_id) WHERE status IN ({states})')
+    db.execute('CREATE INDEX IF NOT EXISTS applications_due ON applications(status, next_attempt_at)')
+    db.execute('CREATE INDEX IF NOT EXISTS applications_url ON applications(canonical_apply_url)')
+    db.execute('CREATE TABLE IF NOT EXISTS llm_usage (day TEXT PRIMARY KEY, requests INTEGER NOT NULL DEFAULT 0)')
+    # Jobs that exist at migration time already had their (old-style) notifications: no approval message flood.
+    db.execute('UPDATE jobs SET action_notified_at=COALESCE(notified_at, discovered_at) WHERE action_notified_at IS NULL')
+
+
+MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2, 3: _migrate_v3, 4: _migrate_v4}
 
 
 def migrate():
@@ -278,13 +308,14 @@ def _write_primary(db, job_id, rec, n, keep_score=False):
                   description=CASE WHEN length(?) >= length(COALESCE(description, '')) OR ? THEN ? ELSE description END,
                   published_at=COALESCE(?, published_at), employer_key=COALESCE(?, employer_key), title_key=?, seniority=?,
                   seniority_sig=?, location_label=?, location_region=?, city=?, country=?, remote_type=?, employment_type=?,
-                  language_req=?, relevance_tier=?, relevance_reason=?, primary_priority=?, score=CASE WHEN ? THEN score ELSE ? END
+                  language_req=?, relevance_tier=?, relevance_reason=?, primary_priority=?, score=CASE WHEN ? THEN score ELSE ? END,
+                  ai_keywords=COALESCE(?, ai_keywords)
                   WHERE id=?''',
                (rec.title, rec.employer, rec.employer, loc.label or rec.location, rec.description or '', not keep_score,
                 rec.description or '', rec.published_at, n['employer_key'], n['title_key'], n['seniority_label'],
                 n['seniority_sig'], loc.label or rec.location, loc.region, loc.city, loc.country or rec.country,
                 loc.remote_type, n['employment_type'], n['language_req'], n['tier'], n['reason'], n['priority'],
-                keep_score, n['score'], job_id))
+                keep_score, n['score'], n.get('ai_keywords'), job_id))
 
 
 # --------------------------------------------------------------------------- lifecycle

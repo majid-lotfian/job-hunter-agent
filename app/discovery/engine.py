@@ -128,9 +128,10 @@ async def _process(run, rec, http, ctx, cfg, now_dt, now, state):
     # Existing scoring, unchanged. A complete employer listing proves the job is open, so the age
     # window (search.yaml max_age_days) is applied to aggregator postings only.
     language_req = language_requirement(rec.title, rec.description)
-    score = core.score_job({'title': rec.title, 'description': rec.description, 'location': loc.label or rec.location or '',
-                            'location_region': loc.region, 'language_req': language_req,
-                            'published_at': rec.published_at if rec.kind == AGGREGATOR else None}, cfg['matching'])
+    score, parts = core.score_breakdown({'title': rec.title, 'description': rec.description,
+                                         'location': loc.label or rec.location or '', 'location_region': loc.region,
+                                         'language_req': language_req,
+                                         'published_at': rec.published_at if rec.kind == AGGREGATOR else None}, cfg['matching'])
     sen = seniority(rec.title, rec.seniority_hint)
     keys = [k for k in dict.fromkeys([ats_key(rec.url), ats_key(rec.apply_url)]) if k]
     n = {'location': loc, 'score': max(score, 0), 'tier': cls.tier, 'reason': '; '.join(cls.reasons),
@@ -138,7 +139,8 @@ async def _process(run, rec, http, ctx, cfg, now_dt, now, state):
          'seniority_label': seniority_label(sen), 'employment_type': employment_type(rec.employment_type),
          'language_req': language_req, 'canonical_url': canonical_url(rec.url),
          'canonical_apply_url': canonical_url(rec.apply_url), 'ats_keys': keys,
-         'priority': store.PRIORITY.get(rec.kind, 1), 'listing': 'complete' if src.complete_listing else 'search'}
+         'priority': store.PRIORITY.get(rec.kind, 1), 'listing': 'complete' if src.complete_listing else 'search',
+         'ai_keywords': ','.join(parts.get('ai_keywords') or {}) or None}
     with state.db:
         outcome, job_id, how = store.upsert(state.db, rec, n, now)
     stats['accepted'] += 1
