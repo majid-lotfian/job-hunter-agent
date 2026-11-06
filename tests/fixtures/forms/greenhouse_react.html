@@ -8,8 +8,11 @@
   <label for="first_name">First Name<span>*</span></label><input id="first_name" type="text" required aria-required="true">
   <label for="last_name">Last Name<span>*</span></label><input id="last_name" type="text" required aria-required="true">
   <label for="email">Email<span>*</span></label><input id="email" type="text" required aria-required="true">
-  <div class="file-upload"><div id="upload-label-resume">Resume/CV<span>*</span></div>
-    <label for="resume">Attach</label><input id="resume" type="file" aria-labelledby="upload-label-resume"></div>
+  <div role="group" aria-labelledby="upload-label-resume" aria-required="true" class="file-upload" data-allow-s3="false">
+    <div id="upload-label-resume" class="label upload-label">Resume/CV<span class="required">*</span></div>
+    <div class="file-upload__wrapper"><button type="button">Attach</button><label class="visually-hidden" for="resume">Attach</label>
+      <input id="resume" class="visually-hidden" type="file" accept=".pdf,.doc,.docx,.txt,.rtf">
+      <span class="file-upload__filename"></span></div></div>
   <div class="select"><label for="question_1">How did you hear about this role?<span>*</span></label>
     <div class="select__control"><div class="select__value"></div>
       <input id="question_1" type="text" role="combobox" aria-expanded="false" aria-required="true" autocomplete="off"></div></div>
@@ -35,6 +38,14 @@ function openMenu() {
   control.after(menu); input.setAttribute('aria-expanded', 'true');
 }
 document.addEventListener('keydown', e => { if (e.key === 'Escape') { const m = document.querySelector('.select__menu'); if (m) m.remove(); } });
+// like the real widget: keep the file in component state, show its name, clear the native input
+let resumeName = '';
+document.getElementById('resume').addEventListener('change', ev => {
+  const f = ev.target.files[0]; if (!f) return;
+  if (params.get('upload') === 'reject') {   // the widget refuses the file: input cleared, no file name shown
+    ev.target.value = ''; document.querySelector('.file-upload__filename').textContent = 'Upload failed, please try again'; return; }
+  resumeName = f.name; document.querySelector('.file-upload__filename').textContent = f.name; ev.target.value = '';
+});
 const ts = params.get('turnstile');           // block = widget waits for a click; pass = widget already passed silently
 if (ts) {
   const root = document.getElementById('ts-host').attachShadow({mode: 'closed'});
@@ -46,7 +57,7 @@ if (ts) {
 document.getElementById('f').addEventListener('submit', ev => {
   ev.preventDefault();
   const ok = ['first_name', 'last_name', 'email'].every(id => document.getElementById(id).value) && chosen
-    && document.getElementById('resume').files.length && document.querySelector('input[name=loc]:checked');
+    && resumeName && document.querySelector('input[name=loc]:checked');
   if (!ok) { const e = document.createElement('div'); e.setAttribute('role', 'alert'); e.textContent = 'Please complete all required fields'; document.body.append(e); return; }
   document.body.innerHTML = '<h1>Thank you for applying!</h1><p>Your application has been submitted.</p>';
 });

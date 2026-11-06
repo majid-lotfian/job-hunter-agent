@@ -135,6 +135,12 @@ class BrowserIntegrationTests(SupervisedBase):
         page = 'https://acme.recruitee.com/o/ml-engineer/c/new'
         self.assertEqual(browser.form_url({'source': 'recruitee:acme', 'source_id': '1'}, {'apply_page': page}), page)
 
+    def test_posting_digest_ignores_entities_and_whitespace(self):
+        from app.applications.prepare import _digest
+        self.assertEqual(_digest('Build Junie.&nbsp; Ship it'), _digest('Build Junie.  Ship it'))
+        self.assertEqual(_digest('A&amp;nbsp;B'), _digest('A B'))
+        self.assertNotEqual(_digest('Build Junie'), _digest('Build Junie CLI'))
+
     def test_mapping(self):
         R = adapters
         self.assertEqual(browser.map_result(CONFIRMED).status, R.SUBMITTED)
@@ -227,6 +233,11 @@ class MockFormBrowserTests(unittest.TestCase):
     def test_real_greenhouse_widgets_combobox_and_checkbox_list(self):
         r = self.run_worker('greenhouse_react.html', self.GH_REACT)
         self.assertEqual((r['status'], r['missing']), ('submitted', []), r)
+
+    def test_rejected_upload_stops_before_submit(self):
+        r = self.run_worker('greenhouse_react.html?upload=reject', self.GH_REACT)
+        self.assertEqual((r['status'], r['submitted_clicked']), ('failed', False), r)
+        self.assertEqual(r['missing'], ['Resume/CV'])
 
     def test_combobox_never_picks_an_unlisted_answer(self):
         fields = [dict(f) for f in self.GH_REACT]

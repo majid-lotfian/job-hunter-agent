@@ -6,6 +6,7 @@ and screening questions, which of them your verified profile answers, and what i
 answered ONLY from explicit `answers` in data/applicant_profile.yaml - never guessed. Nothing is submitted here.
 """
 import hashlib
+import html as html_lib
 import re
 
 from ..core import now_iso
@@ -102,7 +103,9 @@ def match_field(field, profile, cv):
 
 
 def _digest(text):
-    return hashlib.sha256(re.sub(r'\s+', ' ', text or '').strip().encode('utf-8')).hexdigest()[:16]
+    """Fingerprint of the posting's wording: HTML entities (&nbsp; ...) and whitespace differences are ignored."""
+    text = html_lib.unescape(html_lib.unescape(text or '')).replace('\xa0', ' ')
+    return hashlib.sha256(re.sub(r'\s+', ' ', text).strip().encode('utf-8')).hexdigest()[:16]
 
 
 async def build_package(job, adapter, http, profile, cv, cv_version):

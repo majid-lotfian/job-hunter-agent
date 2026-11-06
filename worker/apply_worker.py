@@ -166,6 +166,37 @@ def _group(page, label):
     return None
 
 
+def _attach_file(page, label, cv_path):
+    """Attach the CV to the upload field named `label` and verify it is attached.
+
+    The label can name the file input itself or a wrapper (Greenhouse: role=group labelled "Resume/CV" around a
+    hidden input labelled "Attach"). Widgets that keep the file in their own state clear the input afterwards and show
+    the file name instead, so either a selected file or the file name inside that upload field counts as attached."""
+    labelled = page.get_by_label(label, exact=False)
+    group = None
+    if labelled.count() and labelled.first.get_attribute('type') == 'file':
+        target = labelled.first
+    elif labelled.count() and labelled.first.locator('input[type="file"]').count():
+        group, target = labelled.first, labelled.first.locator('input[type="file"]').first
+    elif page.locator('input[type="file"]').count():
+        target = page.locator('input[type="file"]').first    # fall back to the form's first file input (the resume)
+    else:
+        return False
+    target.set_input_files(str(cv_path))
+    page.wait_for_timeout(1500)
+    try:
+        if target.evaluate('el => el.files.length', timeout=3000) == 1:
+            return True
+    except Exception:
+        pass                                                  # input re-rendered by the widget
+    if group is None:
+        group = target.locator('xpath=ancestor::*[@role="group" or contains(@class, "upload")][1]')
+    try:
+        return group.count() > 0 and Path(cv_path).name in group.inner_text(timeout=3000)
+    except Exception:
+        return False
+
+
 def _choose_in_combobox(page, box, wanted):
     """ARIA combobox (custom dropdown): open it, click the option whose whole text matches, read the choice back from
     the control. Never types free text, never picks a 'closest' option."""
@@ -202,13 +233,7 @@ def fill_field(page, field, cv_path):
     """Fill one field and read it back. Returns True when the value is verifiably in the form."""
     label, kind, value = field['label'], field.get('kind', 'text'), field.get('value')
     if kind == 'file':
-        target = page.get_by_label(label, exact=False)
-        if not target.count() or target.first.get_attribute('type') != 'file':
-            target = page.locator('input[type="file"]')        # fall back to the form's (first) file input
-        if not target.count():
-            return False
-        target.first.set_input_files(str(cv_path))
-        return target.first.evaluate('el => el.files.length') == 1
+        return _attach_file(page, label, cv_path)
     if kind in ('boolean', 'single_choice', 'multi_choice'):
         wanted = [_as_yes_no(value)] if kind == 'boolean' else [(str(v),) for v in (value if isinstance(value, list) else [value])]
         select = page.get_by_label(label, exact=False)

@@ -1,0 +1,177 @@
+# First live dry run (JetBrains job 38): Greenhouse upload fix, posting-change false positive, PR #13 deployment record
+
+- **PR:** #new (renamed after creation)
+- **Branch:** `fix/greenhouse-file-upload` (from `main` a810c26)
+- **Date:** 2026-11-06 17:12 (Europe/Amsterdam) · **Author:** Claude Code (Opus 5.5)
+- **Status:** open: not merged, not deployed. **No application was submitted.** `APPLY_MODE=off`.
+
+> Legend: **Implemented** = code in this PR · **Unit-tested** = automated tests · **Live-verified** = observed on
+> real systems · **Assumed/Proposed** = not verified.
+
+## Owner decisions summary (read first)
+
+1. **PR #13 is merged and deployed** (prod `a810c26`), with your approval:
+   - DB backup in `data/deploy-backup-pr13-20261106/`;
+   - 294 tests OK, plus 21 real-browser tests OK on production;
+   - Playwright 1.63 installed in the production venv;
+   - `BROWSER_WORKER=local` set;
+   - only `job-hunter` restarted; `hotel-bot` untouched.
+2. **Live dry run on job 38 (`submit=false`):**
+   - **all 9 fields filled and read back**: name, email, phone, the CV PDF, LinkedIn, website, and both screening questions (Other; Amsterdam, Netherlands);
+   - **no CAPTCHA challenge** appeared;
+   - **Submit was not clicked.**
+   - The evidence screenshot was checked visually and is stored privately on the VM.
+3. **The first attempt found a real bug** (§2). Production code would stop at the CV upload, safely, before Submit. **This PR must be merged and deployed before the real submission.**
+4. **Ready for a real submission?** Yes, after this PR is deployed. Two caveats:
+   - **(a)** the invisible reCAPTCHA Enterprise decides only at submit;
+   - **(b)** the phone field shows a separate country selector (+31) while the number is entered with +31. The page accepted it in the dry run, but how Greenhouse stores it is seen only at submit.
+
+## 1. Task objective
+
+Do the first end-to-end test with the on-VM worker:
+- deploy PR #13;
+- verify the applicant profile with the owner;
+- prepare job 38;
+- fill the real form with verified data without submitting;
+- capture evidence;
+- report the field results, CAPTCHA behavior and readiness.
+
+## 2. Initial problems identified
+
+- **Resume upload not verified** (live, first dry run 17:08):
+  - On the real Greenhouse form, the "Resume/CV" label belongs to a wrapper `div role=group`. The file input inside it is labelled "Attach" and is visually hidden.
+  - The widget keeps the chosen file in its own state, clears the native input, and shows the file name.
+  - The worker checked `input.files.length == 1`, so it reported the CV as missing and stopped before Submit (status `failed`, `submitted_clicked: false`).
+- **False "posting changed" warning:** the live Greenhouse text contained `&nbsp;` entities that the stored text didn't. The wording is identical (similarity 0.997; the only differences were 4 `&nbsp;`).
+- **Mocks didn't show the upload bug:** the fixture's upload markup was simpler than the real one, so the PoC tests passed while the live form failed.
+
+## 3. Architecture and implementation decisions
+
+- **`_attach_file`** (worker), in order:
+  1. Find the file input: the labelled element itself, the file input **inside** a labelled group, or else the form's first file input.
+  2. Set the file.
+  3. Count it as attached if the input holds it, **or** the file name appears inside that upload field.
+
+  A widget that rejects the file (no name shown) still counts as missing, so the worker stops before Submit.
+- **Fixture:** `greenhouse_react.html` now copies the live upload markup (role=group, hidden input, the file kept in component state, the input cleared). Mode `?upload=reject` simulates a refused file.
+- **`_digest`:** unescapes HTML entities (twice, for double-escaped text) and non-breaking spaces before hashing.
+
+## 4. Files added or modified
+
+| File | Change |
+|---|---|
+| `worker/apply_worker.py` | `_attach_file` replaces the inline file branch |
+| `tests/fixtures/forms/greenhouse_react.html` | Real upload widget structure; `upload=reject` mode |
+| `tests/test_browser_worker.py` | Rejected-upload test (real browser, opt-in), digest test |
+| `app/applications/prepare.py` | `_digest` ignores entities and whitespace |
+| `docs/agent-reports/…`, `README.md` | This report; index row; #13 status set to deployed |
+
+## 5. Features implemented
+
+The upload verification and the digest fix are implemented and unit-tested. The upload fix is also live-verified, on job 38's form with `submit=false`.
+
+## 6. Configuration changes
+
+Production `.env` (VM only, not in git), set during the PR #13 deployment:
+```
+BROWSER_WORKER=local
+BROWSER_WORKER_TIMEOUT_SECONDS=300
+```
+`APPLY_MODE=off`, and `APPLY_LIVE_ADAPTERS` is unchanged.
+
+Production venv: `pip install playwright==1.63.0`. It uses the Chromium build already cached in `~/.cache/ms-playwright/chromium-1243`.
+
+**Proposed:** add `playwright` to `requirements.txt` in a later PR, or keep it as a documented optional dependency. It is not added here.
+
+Applicant profile (`data/applicant_profile.yaml`, private), changed with your confirmation:
+- **verified:** `true`;
+- **new values:** preferred_locations, salary_expectation, notice_period, availability;
+- **standing answers:** "how did you hear" → Other; preferred location → Amsterdam, Netherlands;
+- **work_arrangements:** left empty; you gave no value.
+
+## 7. Tests executed and results
+
+- **Full suite (worktree):** `.venv/bin/python -m unittest discover -s tests` gives **296 tests, OK, 11 skipped**. The skipped ones are opt-in browser tests.
+- **Real-browser tests:** `RUN_BROWSER_TESTS=1 … -m unittest tests.test_browser_worker` gives **22 tests, OK** (85 s). New cases:
+  - the real upload widget attaches the file;
+  - a rejected upload gives `failed` before submit.
+- **Production after the PR #13 deploy:** 294 OK; 21 browser tests OK.
+
+## 8. Live verification results (tested vs. assumed)
+
+**Live-verified, 2026-11-06, job 38:** JetBrains "(Senior) Machine Learning Developer (Junie)", `job-boards.eu.greenhouse.io/jetbrains/jobs/4937092101`.
+
+| Step | Result |
+|---|---|
+| Package (`build_package`, Greenhouse board API) | open vacancy; 11 form fields; 9 to fill, 0 missing, 0 open questions; browser eligibility OK |
+| Dry run 1 (17:08, PR #13 worker) | 8/9 filled; **Resume/CV not verified**, so `failed`; Submit not clicked |
+| Dry run 2 (17:11, this PR's worker) | **9/9 filled and read back**; status `filled`; `submitted_clicked: false`; 10 s |
+| CAPTCHA | no challenge frame, checkbox or Turnstile before or after filling. Invisible reCAPTCHA Enterprise only (as in the PR #13 probe). |
+| Evidence | full-page screenshot, sha256 `fff261a7…d5db`, checked visually; stored at `data/applications/dryrun-38-*/evidence/` on the VM (private, not committed) |
+
+What the screenshot shows (personal values omitted here):
+- the first name, last name, email and phone fields are filled;
+- the tailored CV PDF is attached and listed by file name;
+- LinkedIn and website are filled;
+- "How did you hear about this role?" shows **Other**;
+- **Amsterdam, Netherlands** is ticked;
+- the optional data-retention consent is **unticked**.
+
+**What was sent to JetBrains:** nothing by design. Typing doesn't submit, and the upload widget is marked `data-allow-s3="false"`, so the file is kept in the browser until Submit. Page analytics are outside the agent's control.
+
+**Not verified:**
+- the submit-time reCAPTCHA outcome;
+- Greenhouse's server-side phone handling;
+- the confirmation page text (the worker has generic English confirmation patterns).
+
+## 9. Performance and resource considerations
+
+A dry run takes about 10 s of wall time on the e2-medium. Chromium is short-lived, and the VM had about 3 GB available.
+
+## 10. Security and privacy checks
+
+- **Personal data stays out of git:** no personal values in the code, report, tests or commits. Fixtures use `example.org`.
+- **Evidence:** the screenshot and package are kept under `data/applications/` (gitignored; folder mode 700, files 600).
+- **Profile changes:** only the values you confirmed, and `verified: true` only after your confirmation.
+
+## 11. Known limitations
+
+- The website field gets the profile's GitHub URL (the label "Website/Portfolio/Github Link" matches `github` first), not the portfolio URL. It is optional and acceptable, but tell me if you prefer the portfolio.
+- `work_arrangements` is empty. Forms that ask for it will flag the question.
+- `salary_expectation` is "0", as you specified. A form that asks will receive "0".
+
+## 12. Outstanding issues / decisions needed
+
+1. **Approve merging and deploying this PR.** It is required before a real submission.
+2. **Approve the real submission of job 38.** The steps are in §13. `APPLY_MODE` goes back to `off` right after.
+
+## 13. Deployment instructions (require approval)
+
+1. **Deploy:**
+   - back up the DB;
+   - `git stash push app/main.py deploy/job-hunter.service search.yaml`, then `git merge --ff-only origin/main`, then `git stash pop`;
+   - run the tests;
+   - `sudo systemctl restart job-hunter`.
+2. **Optional:** repeat the dry run on job 38 with the deployed code.
+3. **Real submission (only after your explicit approval):**
+   - set `APPLY_MODE=live` and `APPLY_LIVE_ADAPTERS=browser`, then restart;
+   - approve "apply" for job 38 in Telegram or the dashboard;
+   - the worker submits once and reports `submitted` (with confirmation evidence), `blocked`, or manual follow-up;
+   - set `APPLY_MODE=off` again and restart.
+
+## 14. Rollback instructions
+
+- **Code:** revert the merge commit.
+- **Worker:** an empty `BROWSER_WORKER` disables it.
+- **Profile:** set `verified: false` to stop all use.
+
+## 15. Recommended next steps
+
+1. Deploy this PR.
+2. Do the single approved real submission of job 38.
+3. Review the confirmation evidence and email.
+4. Then Adyen job 15. Its answers are still needed: the data-transfer acknowledgement, and Amsterdam 3 office days or relocation.
+
+## 16. PR URL and commits
+
+See the PR (URL added after creation).
