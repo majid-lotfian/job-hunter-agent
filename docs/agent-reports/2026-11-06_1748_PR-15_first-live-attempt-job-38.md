@@ -1,6 +1,6 @@
 # First live application attempt (JetBrains job 38): not submitted (form validation), root cause, worker fixes
 
-- **PR:** #new (renamed after creation)
+- **PR:** [#15](https://github.com/majid-lotfian/job-hunter-agent/pull/15)
 - **Branch:** `fix/autofill-reverify` (from `main` 401d542)
 - **Date:** 2026-11-06 17:48 (Europe/Amsterdam) · **Author:** Claude Code (Opus 5.5)
 - **Status:** open: not merged, not deployed. `APPLY_MODE=off` (restored at 17:29).
@@ -183,4 +183,4 @@ A worker run now takes about 25 s (network idle, hydration, autofill settle, fin
 
 ## 16. PR URL and commits
 
-See the PR (URL added after creation).
+https://github.com/majid-lotfian/job-hunter-agent/pull/15 · commits: 114cfb0 (fixes, tests, report), then the rename commit.
