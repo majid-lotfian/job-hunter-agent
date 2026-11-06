@@ -1,0 +1,114 @@
+# Job discovery sources and behaviour (see docs/discovery/SOURCES.md).
+# Matching/scoring stays in search.yaml. Boards listed under search.yaml `sources:` are still included.
+# Every board below was verified against its real public endpoint (2026-11-05). Add/remove freely.
+
+settings:
+  concurrency: 3                 # sources fetched in parallel (small VM: keep low)
+  request_timeout_seconds: 20
+  max_response_mb: 15            # abort oversized responses
+  retries: 2                     # per request, exponential backoff + jitter, honours Retry-After
+  close_after_missed_scans: 2    # complete ATS listings: close a job after N successful scans without it
+  stale_after_days: 21           # jobs only seen on search/aggregator feeds: 'stale' after N days unseen
+  aggregator_max_age_days: 30    # ignore aggregator postings older than this
+  accept_nl_outside_randstad: true   # e.g. Eindhoven; marked "outside Randstad" in the dashboard
+  allow_relocation: false        # true = also accept onsite jobs outside the Netherlands
+
+notifications:
+  min_score: null                # include new relevant jobs with score >= this in the per-scan Telegram digest
+                                 # (null = search.yaml min_score). One digest per scan, never one message per job.
+
+sources:
+  # ---------------- Employer ATS boards (direct postings; complete listings) ----------------
+  greenhouse:
+    - {board: adyen, name: Adyen}
+    - {board: bolcom, name: bol.com}
+    - {board: databricks, name: Databricks}
+    - {board: nebius, name: Nebius}
+    - {board: imc, name: IMC Trading}
+    - {board: flowtraders, name: Flow Traders}
+    - {board: catawiki, name: Catawiki}
+    - {board: dept, name: DEPT}
+    - {board: datadog, name: Datadog}
+    - {board: jetbrains, name: JetBrains}
+    - {board: elastic, name: Elastic}
+    - {board: celonis, name: Celonis}
+    - {board: gitlab, name: GitLab}
+    - {board: grafanalabs, name: Grafana Labs}
+    - {board: hellofresh, name: HelloFresh}
+    - {board: samsara, name: Samsara}
+    - {board: thoughtworks, name: Thoughtworks}
+    - {board: dataiku, name: Dataiku}
+    - {board: stripe, name: Stripe}
+    - {board: algolia, name: Algolia}
+    - {board: getyourguide, name: GetYourGuide}
+    - {board: fivetran, name: Fivetran}
+  lever:
+    - {company: jobgether, aggregator: true, locations: [Netherlands]}   # aggregator board; NL filter server-side (was 47 MB/scan)
+    - {company: mendix, name: Mendix}
+    - {company: bloomon, name: Bloomon}
+  ashby:
+    - {board: mollie, name: Mollie}
+    - {board: prosus, name: Prosus}
+    - {board: clickhouse, name: ClickHouse}
+    - {board: crisp, name: Crisp}
+    - {board: n8n, name: n8n}
+    - {board: bynder, name: Bynder}
+    - {board: elevenlabs, name: ElevenLabs}
+    - {board: polarsteps, name: Polarsteps}
+    - {board: lightspeedhq, name: Lightspeed}
+    - {board: snowflake, name: Snowflake}
+    - {board: miro, name: Miro}
+    - {board: deepl, name: DeepL}
+    - {board: cradlebio, name: Cradle}
+    - {board: weaviate, name: Weaviate}
+    - {board: deeploy, name: Deeploy}
+    - {board: langchain, name: LangChain}
+    - {board: doctolib, name: Doctolib}
+  smartrecruiters:
+    - {company: ServiceNow, name: ServiceNow}
+    - {company: KPN, name: KPN}
+    - {company: Coolblue, name: Coolblue}
+    - {company: Devoteam, name: Devoteam}
+    - {company: TOPdesk, name: TOPdesk}
+    - {company: Picnic, name: Picnic}
+    - {company: Wonderkind, name: Wonderkind}
+  recruitee:
+    - {company: conclusion, name: Conclusion}
+    - {company: centric, name: Centric}
+    - {company: eraneos, name: Eraneos}
+    # dpgmedia (DPG Media) omitted: its offers listing exceeds the 15 MB response cap (translated descriptions)
+    - {company: bunq, name: bunq}
+    - {company: nmbrs, name: Nmbrs}
+    - {company: funda, name: Funda}
+    - {company: greenchoice, name: Greenchoice}
+    - {company: rtl, name: RTL Nederland}
+    - {company: aimms, name: AIMMS}
+  workable:
+    - {account: huggingface, name: Hugging Face}
+  personio:
+    - {company: ohpen, name: Ohpen}
+  teamtailor:
+    - {subdomain: sendcloud, name: Sendcloud}
+    - {subdomain: lightyear, name: Lightyear}
+  # Workday career-site search (public, no login; robots.txt explicitly allows each site below). Query-based, so
+  # absence is never treated as closure. Each entry passed 2 live test runs on 2026-11-05 (see agent report).
+  workday:
+    - {tenant: philips, wd: wd3, site: jobs-and-careers, name: Philips, enabled: true}
+    - {tenant: nvidia, wd: wd5, site: NVIDIAExternalCareerSite, name: NVIDIA, enabled: true}
+    - {tenant: ing, wd: wd3, site: ICSGBLCOR, name: ING, enabled: true}          # ICSNLDGEN has only ~5 postings
+    - {tenant: relx, id: relx-elsevier, wd: wd3, site: ElsevierJobs, name: Elsevier (RELX), enabled: true}
+    - {tenant: relx, wd: wd3, site: relx, name: RELX, enabled: false}            # works, 0 relevant NL roles in 2 runs; Elsevier site covers RELX in NL
+    - {tenant: wk, wd: wd3, site: External, name: Wolters Kluwer, enabled: true}
+
+  # ---------------- Job-board / aggregator APIs (free, no key) ----------------
+  arbeitnow: {max_pages: 6}                 # EU board with many NL/DE tech jobs
+  themuse: {max_pages: 3}                   # NL cities x tech categories
+  himalayas: {max_pages: 2}                 # remote jobs open to NL
+  jobicy: {}                                # remote jobs (NL / Europe / EMEA)
+  remotive: {}                              # remote jobs; max 4 requests/day per their terms (interval 6h)
+  remoteok: {}                              # remote jobs; attribution required (link kept)
+  workingnomads: {}                         # recent remote jobs
+
+  # ---------------- Optional (need free API keys in .env; disabled until set) ----------------
+  adzuna: {max_pages: 2}                    # ADZUNA_APP_ID + ADZUNA_APP_KEY
+  jooble: {max_pages: 2}                    # JOOBLE_API_KEY
