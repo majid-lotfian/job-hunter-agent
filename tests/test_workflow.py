@@ -123,7 +123,7 @@ class Base(unittest.TestCase):
             return db.execute(
                 "INSERT INTO jobs (source,source_id,company,employer,title,location,description,url,apply_url,discovered_at,score,"
                 "availability,relevance_tier) VALUES (?,?,?,?,?,'Amsterdam','We need Python, RAG and LLM agents.',?,?,'now',?,'active','primary')",
-                (source, os.urandom(4).hex(), 'acme', 'Acme', title, url or f'https://jobs.example/{os.urandom(3).hex()}',
+                (source, 'x' + os.urandom(4).hex(), 'acme', 'Acme', title, url or f'https://jobs.example/{os.urandom(3).hex()}',
                  url, score)).lastrowid
 
     def make_cv(self, job_id):
