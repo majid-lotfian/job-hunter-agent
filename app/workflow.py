@@ -22,6 +22,16 @@ APPROVE_APPLY, APPROVE_CV_APPLY, REJECT = 'approve_apply', 'approve_cv_apply', '
 ACTION_CODES = {'aa': APPROVE_APPLY, 'ac': APPROVE_CV_APPLY, 'rj': REJECT}
 CODE_FOR = {v: k for k, v in ACTION_CODES.items()}
 LABELS = {APPROVE_APPLY: 'Approve & Apply', APPROVE_CV_APPLY: 'Approve CV & Apply', REJECT: 'Reject'}
+# While automatic submission is off (the default) an approval prepares a supervised application for your review.
+PREPARE_LABELS = {APPROVE_APPLY: 'Prepare Application', APPROVE_CV_APPLY: 'Prepare Application + CV', REJECT: 'Reject'}
+
+
+def supervised():
+    return os.getenv('APPLY_MODE', 'off').strip().lower() != 'live'
+
+
+def labels():
+    return PREPARE_LABELS if supervised() else LABELS
 CLOSED_JOB_STATUSES = ('rejected', 'applied', 'interview', 'closed')
 LIVE_APP_STATES = ('awaiting_cv', 'queued', 'submitting', 'submitted', 'confirmed')
 
@@ -114,10 +124,17 @@ def job_state(job_id):
         cv_row = db.execute('SELECT * FROM cv_jobs WHERE job_id=?', (job_id,)).fetchone()
         live, last = _live_application(db, job_id), latest_application(db, job_id)
     cv_ver = cv_version(job_id)
+    detail = json.loads(last['detail'] or '{}') if last else {}
+    package = detail.pop('package', None) or {}      # full package (with your values) only on the review page
+    detail.pop('fields', None)
+    if package:
+        detail['summary'] = {'missing': len(package.get('missing') or []), 'questions': len(package.get('questions') or []),
+                             'captcha': package.get('captcha'), 'ready': package.get('ready')}
     return {'workflow': workflow_for(job['score']), 'actions': available_actions(job, cv_row, live, last),
-            'token': action_token(job, cv_ver), 'cv_version': cv_ver,
+            'token': action_token(job, cv_ver), 'cv_version': cv_ver, 'action_labels': labels(),
+            'application_id': last['id'] if last else None,
             'application_status': last['status'] if last else None,
-            'application_detail': json.loads(last['detail'] or '{}') if last else {},
+            'application_detail': detail,
             'ai_keywords': [k for k in (job['ai_keywords'] or '').split(',') if k]}
 
 
@@ -152,7 +169,7 @@ def decide(job_id, action, *, channel, token, actor=None):
             return Decision(result='stale', message='This action is outdated (job or CV changed). Use the latest message or the dashboard.')
         allowed = available_actions(job, cv_row, live, last)
         if action not in allowed:
-            return Decision(result='not_available', message=f'Not available now ({", ".join(LABELS[a] for a in allowed) or "no actions"})')
+            return Decision(result='not_available', message=f'Not available now ({", ".join(labels()[a] for a in allowed) or "no actions"})')
         jv = job_version(job)
         now = now_iso()
         if action == REJECT:
@@ -175,7 +192,8 @@ def decide(job_id, action, *, channel, token, actor=None):
             db.execute("INSERT INTO applications (job_id, approval_id, status, job_version, cv_version, apply_url, created_at, updated_at) "
                        "VALUES (?,?,?,?,?,?,?,?)", (job_id, approval_id, 'queued', jv, cv_ver, apply_url, now, now))
             _event(db, job_id, 'approved', f'{channel}: Approve & Apply (CV {cv_ver})')
-            return Decision(result='approved', message='Approved - application queued')
+            return Decision(result='approved', message='Approved - preparing the application for your review' if supervised()
+                            else 'Approved - application queued')
         db.execute("INSERT INTO applications (job_id, approval_id, status, job_version, apply_url, created_at, updated_at) "
                    "VALUES (?,?,?,?,?,?,?)", (job_id, approval_id, 'awaiting_cv', jv, apply_url, now, now))
         _event(db, job_id, 'approved', f'{channel}: Approve CV & Apply')
@@ -186,7 +204,8 @@ def decide(job_id, action, *, channel, token, actor=None):
     else:
         cv_pipeline.enqueue(job_id, 'approved', force=bool(row and row['status'] in ('ready', 'needs_review')))
         set_cv_job(job_id, 'pending', reason='approved')
-    return Decision(result='cv_queued', message='Approved - generating CV, then applying')
+    return Decision(result='cv_queued', message='Approved - generating the CV, then preparing the application' if supervised()
+                    else 'Approved - generating CV, then applying')
 
 
 def on_cv_finished(job_id, status):
@@ -226,7 +245,8 @@ def _pause(db, app, now, reason):
 # --------------------------------------------------------------------------- Telegram messages
 
 def keyboard(job_id, actions, token):
-    return {'inline_keyboard': [[{'text': LABELS[a], 'callback_data': f'wf:{CODE_FOR[a]}:{job_id}:{token}'} for a in actions]]}
+    names = labels()
+    return {'inline_keyboard': [[{'text': names[a], 'callback_data': f'wf:{CODE_FOR[a]}:{job_id}:{token}'} for a in actions]]}
 
 
 def action_message(job, state, cv_row=None):
@@ -245,8 +265,12 @@ def action_message(job, state, cv_row=None):
     if state['cv_version']:
         lines.append(f"Review CV: {dashboard_base()}/api/jobs/{job['id']}/cv")
     lines.append(f"Apply URL: {job['apply_url'] or job['url']}")
-    hint = {APPROVE_APPLY: 'Approve & Apply submits this CV version.',
-            APPROVE_CV_APPLY: 'Approve CV & Apply = generate + validate the CV, then apply (no second approval).'}
+    hint = ({APPROVE_APPLY: 'Prepare Application = check the vacancy, match your profile to the form and assemble the CV PDF '
+                            'for your review. You submit it yourself.',
+             APPROVE_CV_APPLY: 'Prepare Application + CV = generate + validate the CV, then prepare the application for your review.'}
+            if supervised() else
+            {APPROVE_APPLY: 'Approve & Apply submits this CV version.',
+             APPROVE_CV_APPLY: 'Approve CV & Apply = generate + validate the CV, then apply (no second approval).'})
     lines += [hint[a] for a in state['actions'] if a in hint]
     lines.append('Nothing is submitted without your approval.')
     return '\n'.join(x for x in lines if x)

@@ -13,6 +13,12 @@ Rules:
 - The CV attachment is the PDF rendered from the current HTML CV (app.pdf). If it is missing, invalid or older than
   the HTML, nothing is submitted: the application stops for manual action and a new PDF is requested.
 - An application left in 'submitting' by a crash/restart is never retried automatically (outcome unknown).
+
+Supervised (browser-assisted) applications: every processed application gets a review package
+(app/applications/prepare.py: vacancy check, CV PDF, form fields, profile matches, missing info, screening questions).
+When automatic submission is off, not permitted, or the employer's form uses a CAPTCHA, the application stops in
+manual_action_required with detail.prepared=True: you open the employer's page, submit yourself, and record it with
+mark_submitted() - which requires your confirmation text. Nothing here ever claims a submission on its own.
 """
 import json
 import os
@@ -23,6 +29,7 @@ from ..discovery.http import HttpClient
 from ..discovery.normalize import canonical_url
 from ..pdf import pdf_is_current
 from . import adapters
+from .prepare import build_package
 from .profile import load_profile
 
 NOTIFY_STATES = ('manual_action_required', 'blocked', 'failed', 'submitted', 'confirmed', 'dry_run')
@@ -121,7 +128,7 @@ async def process(app_id, http, cfg=None):
         return finish('manual_action_required', 'CV PDF is missing, invalid or outdated - nothing was submitted. '
                       'A new PDF was requested; approve again once it is ready.',
                       detail={'missing': ['CV as PDF'], 'reapprove': True})
-    # 4. readiness (read-only)
+    # 4. readiness (read-only) and the review package for supervised submission
     adapter = adapters.select_adapter(job)
     plan = await adapter.prepare(http, job, profile, cv)
     detail = {'adapter': adapter.name, 'missing': plan.missing, 'fields': plan.fields}
@@ -129,13 +136,19 @@ async def process(app_id, http, cfg=None):
         db.execute('UPDATE applications SET adapter=?, mode=? WHERE id=?', (adapter.name, cfg['mode'], app_id))
     if plan.status == adapters.RETRY:
         return _retry_or_fail(app_id, app, job, plan.message, cfg)
-    if plan.status in (adapters.MANUAL, adapters.BLOCKED):
+    package = await _package(job, adapter, http, profile, cv, current_cv)
+    detail['package'] = package
+    if package['availability']['open'] is False:
+        return finish('blocked', 'The vacancy is no longer open - nothing was submitted.', detail=detail)
+    if plan.status == adapters.BLOCKED:
         return finish(plan.status, plan.message, detail=detail)
-    # 5. mode gates - nothing leaves the VM unless live mode + live-capable adapter + explicitly allowed
-    if cfg['mode'] == 'off':
-        return finish('manual_action_required', 'Ready, but automatic submission is not activated (APPLY_MODE=off) - apply manually.',
+    # 5. mode gates - nothing leaves the VM unless live mode + live-capable adapter + explicitly allowed + no CAPTCHA
+    if plan.status == adapters.MANUAL or cfg['mode'] == 'off' or package['captcha']:
+        detail.update(prepared=True, missing=package['missing'] + package['questions'])
+        return finish('manual_action_required', prepared_message(package, plan.message if plan.status == adapters.MANUAL else None),
                       detail=detail)
     if cfg['mode'] == 'dry_run' or not adapter.live_capable or adapter.name not in cfg['live_adapters']:
+        detail['prepared'] = True
         return finish('dry_run', f'Dry run OK via {adapter.name} - nothing was submitted. Apply manually.', detail=detail)
     # 6. live submission
     result = await adapter.submit(http, job, profile, cv, plan)
@@ -155,6 +168,126 @@ async def process(app_id, http, cfg=None):
     if result.status in (adapters.SUBMITTED, adapters.CONFIRMED):  # no confirmation id: outcome uncertain
         return finish('manual_action_required', 'Submission returned no confirmation id - verify in your email/portal.', detail=detail)
     return finish(result.status if result.status in NOTIFY_STATES else 'manual_action_required', result.message, detail=detail)
+
+
+async def _package(job, adapter, http, profile, cv, cv_version):
+    try:
+        return await build_package(job, adapter, http, profile, cv, cv_version)
+    except Exception as exc:   # preparation problems never break the state machine
+        log.exception('Preparing the application package for job %s failed', job['id'])
+        return {'prepared_at': now_iso(), 'job': {'id': job['id'], 'title': job['title'], 'employer': job['employer'] or job['company']},
+                'apply_page': job['apply_url'] or job['url'], 'adapter': adapter.name, 'availability': {'open': None, 'checked_via': ''},
+                'captcha': None, 'submission': 'browser', 'posting_changed': False,
+                'cv': {'version': cv_version, 'html': f"/api/jobs/{job['id']}/cv", 'pdf': f"/api/jobs/{job['id']}/cv.pdf",
+                       'pdf_current': bool(cv.get('pdf'))},
+                'fields': [], 'missing': [], 'questions': [], 'profile': {'verified': bool(profile and profile.verified), 'errors': [], 'notes': []},
+                'warnings': [f'Could not read the employer\'s form ({type(exc).__name__}) - check the page yourself.'], 'notes': [], 'ready': False}
+
+
+def prepared_message(package, reason=None):
+    parts = ['Prepared for your review - submit it yourself in your browser, then record the confirmation.']
+    if package.get('captcha'):
+        parts.append('The employer\'s form uses a CAPTCHA.')
+    if package['missing'] or package['questions']:
+        parts.append(f"Needs your input: {len(package['missing'])} missing item(s), {len(package['questions'])} question(s).")
+    if reason and 'missing information' not in reason:
+        parts.append(reason)
+    return ' '.join(parts)
+
+
+def _app_row(db, app_id):
+    return db.execute('SELECT a.*, j.title, j.employer, j.company, j.status AS job_status FROM applications a '
+                      'JOIN jobs j ON j.id=a.job_id WHERE a.id=?', (app_id,)).fetchone()
+
+
+def is_prepared(app):
+    return app is not None and app['status'] in ('manual_action_required', 'dry_run') \
+        and bool(json.loads(app['detail'] or '{}').get('prepared'))
+
+
+async def refresh_package(app_id, http=None):
+    """Re-check a prepared application (vacancy, form, profile, CV PDF) - read-only, never submits."""
+    from .. import workflow
+    with connect() as db:
+        app = _app_row(db, app_id)
+        job = db.execute('SELECT * FROM jobs WHERE id=?', (app['job_id'],)).fetchone() if app else None
+    if not is_prepared(app):
+        raise ValueError('Only prepared applications can be refreshed')
+    own = http is None
+    http = http or HttpClient(timeout=20, retries=1, default_interval=2.0)
+    try:
+        package = await _package(job, adapters.select_adapter(job), http, load_profile(), _cv_bundle(job['id']),
+                                 workflow.cv_version(job['id']))
+    finally:
+        if own:
+            await http.aclose()
+    with connect() as db:
+        detail = json.loads(app['detail'] or '{}')
+        detail.update(package=package, missing=package['missing'] + package['questions'], reason=prepared_message(package))
+        db.execute('UPDATE applications SET detail=?, updated_at=? WHERE id=?', (json.dumps(detail), now_iso(), app_id))
+        _event(db, app['job_id'], 'application_refreshed', 'Application package re-checked')
+    return package
+
+
+def mark_submitted(app_id, confirmation, *, confirmed, actor='dashboard'):
+    """Record YOUR manual submission. Requires a prepared application, your explicit confirmation flag and a
+    confirmation text (employer reference, email subject or similar). Never called automatically."""
+    confirmation = (confirmation or '').strip()
+    if confirmed is not True:
+        raise ValueError('Confirm that you submitted the application yourself')
+    if len(confirmation) < 3:
+        raise ValueError('Enter the confirmation you received (reference number, email subject, ...)')
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        app = _app_row(db, app_id)
+        if app is None:
+            raise LookupError('Unknown application')
+        if app['status'] in ('submitted', 'confirmed'):
+            raise ValueError('Already recorded as submitted')
+        if not is_prepared(app):
+            raise ValueError('Only a prepared application can be marked as submitted')
+        canon = app['canonical_apply_url'] or canonical_url(app['apply_url'])
+        dup = db.execute("SELECT job_id FROM applications WHERE canonical_apply_url=? AND id!=? AND status IN ('submitting','submitted','confirmed')",
+                         (canon, app_id)).fetchone() if canon else None
+        if dup:
+            raise ValueError(f"Already applied to this vacancy (job {dup['job_id']}) - duplicate prevented")
+        if db.execute("SELECT 1 FROM applications WHERE job_id=? AND id!=? AND status IN ('submitted','confirmed')",
+                      (app['job_id'], app_id)).fetchone():
+            raise ValueError('This job already has a recorded submission')
+        stamp = now_iso()
+        detail = json.loads(app['detail'] or '{}')
+        detail.update(submitted_manually=True, confirmation=confirmation[:300], recorded_by=actor,
+                      reason='Submitted by you in your browser (confirmation recorded).')
+        _set(db, app_id, 'submitted', external_id=f'manual:{confirmation[:200]}', submitted_at=stamp, last_error=None,
+             detail=json.dumps(detail), notified_at=stamp, canonical_apply_url=canon)
+        _event(db, app['job_id'], 'application_submitted_manually', f'{actor}: {confirmation[:300]}')
+        if app['job_status'] != 'applied':
+            db.execute("UPDATE jobs SET status='applied' WHERE id=?", (app['job_id'],))
+            _event(db, app['job_id'], 'applied', f'Manual submission confirmed: {confirmation[:300]}')
+    return 'submitted'
+
+
+CANCELLABLE = ('awaiting_cv', 'queued', 'manual_action_required', 'dry_run', 'blocked', 'failed')
+
+
+def cancel(app_id, actor='dashboard'):
+    """Withdraw a not-yet-submitted application; the job can be prepared again later."""
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        app = _app_row(db, app_id)
+        if app is None:
+            raise LookupError('Unknown application')
+        if app['status'] not in CANCELLABLE:
+            raise ValueError(f"Cannot cancel an application that is {app['status'].replace('_', ' ')}")
+        _set(db, app_id, 'cancelled', notified_at=now_iso())
+        if app['approval_id']:
+            db.execute("UPDATE approvals SET status='revoked' WHERE id=? AND status='active'", (app['approval_id'],))
+        db.execute("UPDATE cv_jobs SET status='cancelled', updated_at=? WHERE job_id=? AND status IN ('pending','waiting_retry') "
+                   "AND reason='approved'", (now_iso(), app['job_id']))
+        if app['job_status'] == 'approved':
+            db.execute("UPDATE jobs SET status='new', action_notified_at=NULL WHERE id=?", (app['job_id'],))
+        _event(db, app['job_id'], 'application_cancelled', f'{actor}: cancelled before submission')
+    return 'cancelled'
 
 
 def _retry_or_fail(app_id, app, job, message, cfg):
@@ -225,6 +358,24 @@ async def send_application_updates(sender=None, limit=10):
                 db.execute('UPDATE applications SET notified_at=? WHERE id=?', (now_iso(), r['id']))
             continue
         detail = json.loads(r['detail'] or '{}')
+        if detail.get('prepared') and r['status'] in ('manual_action_required', 'dry_run'):
+            pkg = detail.get('package') or {}
+            lines = [f"Application ready for review: {r['title']} — {r['employer'] or r['company']} ({r['score']}/100)",
+                     'Submit it yourself in your browser' + (' (the form uses a CAPTCHA)' if pkg.get('captcha') else '') + '.',
+                     f"Needs your input: {len(pkg.get('missing') or [])} missing item(s), {len(pkg.get('questions') or [])} question(s)."
+                     if (pkg.get('missing') or pkg.get('questions')) else 'All known fields are filled from your verified profile.',
+                     f"Review: {dashboard_base()}/applications/{r['id']}",
+                     f"Apply manually: {r['apply_url'] or r['url']}",
+                     'Nothing has been submitted.']
+            try:
+                await send('\n'.join(lines))
+            except Exception:
+                log.exception('Telegram application update failed for application %s', r['id'])
+                continue
+            with connect() as db:
+                db.execute('UPDATE applications SET notified_at=? WHERE id=?', (now_iso(), r['id']))
+            sent += 1
+            continue
         label = {'submitted': 'Application submitted', 'confirmed': 'Application confirmed', 'dry_run': 'Dry run only - not submitted',
                  'blocked': 'Application blocked', 'failed': 'Application failed',
                  'manual_action_required': 'Manual action needed'}[r['status']]

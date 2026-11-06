@@ -167,10 +167,10 @@ class AutoCvWorkflowTests(Base):
         self.assertIn('AI keywords:', self.sent[0])
         self.assertIn('Apply URL:', self.sent[0])
         buttons = self.markups[0]['inline_keyboard'][0]
-        self.assertEqual([b['text'] for b in buttons], ['Approve & Apply', 'Reject'])
+        self.assertEqual([b['text'] for b in buttons], ['Prepare Application', 'Reject'])
         data = buttons[0]['callback_data']
         answer, remove = workflow.handle_telegram_callback(data, chat_id='42', user_id='7', allowed_chat='42')
-        self.assertEqual((answer, remove), ('Approved - application queued', True))
+        self.assertEqual((answer, remove), ('Approved - preparing the application for your review', True))
         app = self.apps(job)[0]
         self.assertEqual((app['status'], app['cv_version']), ('queued', workflow.cv_version(job)))
         self.assertEqual(self.job(job)['status'], 'approved')
@@ -225,7 +225,7 @@ class ApprovalWorkflowTests(Base):
         cv_pipeline.enqueue(auto, 'new')
         run(workflow.send_pending_actions(sender=self.send))
         self.assertEqual(len(self.sent), 1)
-        self.assertEqual([b['text'] for b in self.markups[0]['inline_keyboard'][0]], ['Approve CV & Apply', 'Reject'])
+        self.assertEqual([b['text'] for b in self.markups[0]['inline_keyboard'][0]], ['Prepare Application + CV', 'Reject'])
         self.assertIsNone(core.get_cv_job(job))                             # no automatic CV for 40-69
         result = workflow.decide(job, workflow.APPROVE_CV_APPLY, channel='telegram', token=self.state(job)['token'])
         self.assertEqual(result['result'], 'cv_queued')
