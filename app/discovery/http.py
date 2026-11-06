@@ -84,6 +84,13 @@ class HttpClient:
             response._content = b''.join(chunks)
             return response
 
+    async def send_once(self, method, url, *, max_bytes=1_000_000, **kwargs):
+        """Exactly one request (paced, no retries, any status returned). For non-idempotent submissions:
+        a retry after a timeout could create a second application. Network errors propagate to the caller."""
+        await self._pace(urlsplit(url).hostname or '')
+        self.requests += 1
+        return await self._fetch(method, url, max_bytes, **kwargs)
+
     async def request(self, method, url, *, expect='json', max_bytes=None, **kwargs):
         """Return parsed JSON (expect='json'), text (expect='text') or the response ('response')."""
         host = urlsplit(url).hostname or ''

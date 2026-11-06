@@ -24,6 +24,15 @@ from app.applications import adapters, profile as profile_mod  # noqa: E402
 from app.discovery.http import HttpClient  # noqa: E402
 from tests.test_cv_pipeline import MASTER, FakeProvider, fake_runner, good_reply  # noqa: E402
 
+BASE_PROFILE = """verified: true
+first_name: Test
+last_name: Candidate
+email: candidate@example.org
+phone: "+31 6 1234 5678"
+location: Utrecht, Netherlands
+work_authorization: EU citizen
+"""
+
 PROFILE_YAML = """verified: true
 first_name: Test
 last_name: Candidate
@@ -63,6 +72,10 @@ class LiveMockAdapter(adapters.Adapter):
     async def prepare(self, http, job, profile, cv):
         return self.plan
 
+    async def form(self, http, job):   # a form that permits automated submission (no CAPTCHA, no consent box)
+        return adapters.FormSpec(adapters.generic_fields(), available=True, captcha=False, consent_required=False,
+                                 apply_page=job['apply_url'] or job['url'], checked_via='mock')
+
     async def submit(self, http, job, profile, cv, plan):
         self.submits += 1
         if isinstance(self.result, Exception):
@@ -98,6 +111,7 @@ class Base(unittest.TestCase):
                                                'LLM_MAX_REQUESTS_PER_DAY': '250', 'TELEGRAM_ACTIONS_PER_BATCH': '8'})):
             p.start()
             self.addCleanup(p.stop)
+        self.profile_path.write_text(BASE_PROFILE)   # complete, verified profile (live submission requires one)
         cv_pipeline.clear_cooldown()
         workflow._last_summary['count'] = None
         with core.connect() as db:
@@ -432,7 +446,7 @@ class RecruiteeAdapterTests(Base):
                                                        {'html': self.tmp, 'pdf': self.tmp}))
         self.assertIn('profile not marked verified: true', plan.missing)
         self.assertTrue(any('work permit' in m for m in plan.missing))
-        self.assertFalse(adapters.RecruiteeAdapter.live_capable)
+        self.assertTrue(adapters.RecruiteeAdapter.live_capable)     # live only via gated submit(); see test_autonomous
 
 
 class PdfAttachmentTests(Base):

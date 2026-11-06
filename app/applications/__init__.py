@@ -142,8 +142,10 @@ async def process(app_id, http, cfg=None):
         return finish('blocked', 'The vacancy is no longer open - nothing was submitted.', detail=detail)
     if plan.status == adapters.BLOCKED:
         return finish(plan.status, plan.message, detail=detail)
-    # 5. mode gates - nothing leaves the VM unless live mode + live-capable adapter + explicitly allowed + no CAPTCHA
-    if plan.status == adapters.MANUAL or cfg['mode'] == 'off' or package['captcha']:
+    # 5. mode gates - nothing leaves the VM unless live mode + live-capable adapter + explicitly allowed + a form that
+    #    permits autonomous submission (no CAPTCHA, no consent agreement, every required field known)
+    if plan.status == adapters.MANUAL or cfg['mode'] == 'off' or package['captcha'] \
+            or not package.get('autonomous', {}).get('possible'):
         detail.update(prepared=True, missing=package['missing'] + package['questions'])
         return finish('manual_action_required', prepared_message(package, plan.message if plan.status == adapters.MANUAL else None),
                       detail=detail)
@@ -167,6 +169,8 @@ async def process(app_id, http, cfg=None):
         return _retry_or_fail(app_id, app, job, result.message, cfg)
     if result.status in (adapters.SUBMITTED, adapters.CONFIRMED):  # no confirmation id: outcome uncertain
         return finish('manual_action_required', 'Submission returned no confirmation id - verify in your email/portal.', detail=detail)
+    if result.missing:
+        detail['missing'] = result.missing
     return finish(result.status if result.status in NOTIFY_STATES else 'manual_action_required', result.message, detail=detail)
 
 

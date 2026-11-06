@@ -263,7 +263,18 @@ def action_message(job, state, cv_row=None):
     if reason:
         lines.append(f'Paused: {reason}')
     if state['cv_version']:
-        lines.append(f"Review CV: {dashboard_base()}/api/jobs/{job['id']}/cv")
+        lines.append(f"CV version {state['cv_version']}: {dashboard_base()}/api/jobs/{job['id']}/cv "
+                     f"(PDF: {dashboard_base()}/api/jobs/{job['id']}/cv.pdf)")
+    from .applications import adapters   # lazy: applications imports this module
+    adapter = adapters.select_adapter(job)
+    if supervised():
+        lines.append(f'Application system: {adapter.name} - you submit in your browser (automatic submission is off).')
+    elif adapter.live_capable:
+        lines.append(f'Application system: {adapter.name} - after approval it is submitted automatically ONLY if the '
+                     'employer\'s form has no CAPTCHA, no consent box and every required field is in your verified profile; '
+                     'it sends your name, email, phone, the CV PDF above and your saved answers. Otherwise it is prepared for you.')
+    else:
+        lines.append(f'Application system: {adapter.name} - no applicant-permitted submission API; prepared for you to submit.')
     lines.append(f"Apply URL: {job['apply_url'] or job['url']}")
     hint = ({APPROVE_APPLY: 'Prepare Application = check the vacancy, match your profile to the form and assemble the CV PDF '
                             'for your review. You submit it yourself.',
