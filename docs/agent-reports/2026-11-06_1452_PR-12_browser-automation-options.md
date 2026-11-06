@@ -1,6 +1,6 @@
 # Browser automation options for applicant-facing forms (+ PR #10/#11 deployment record)
 
-- **PR:** #new (renamed after creation)
+- **PR:** #12 - https://github.com/majid-lotfian/job-hunter-agent/pull/12
 - **Branch:** `docs/browser-automation-options` · **Commits:** this report, the index update and one test-fixture fix
 - **Date:** 2026-11-06 14:52 (Europe/Amsterdam) · **Author:** Claude Code (Opus 5.5)
 - **Status:** open. Investigation only; no automation infrastructure was implemented, as you asked.
@@ -79,7 +79,7 @@ The key constraint is the same everywhere: invisible CAPTCHAs score the browsing
 
 | File | Change |
 |---|---|
-| `docs/agent-reports/2026-11-06_1452_PR-new_browser-automation-options.md` | This report |
+| `docs/agent-reports/2026-11-06_1452_PR-12_browser-automation-options.md` | This report |
 | `docs/agent-reports/README.md` | Index row; PRs #10 and #11 marked deployed |
 | `tests/test_workflow.py` | Test job `source_id` is never all-digit (flake fix) |
 
@@ -165,7 +165,7 @@ Revert the PR. Production rollback for #10/#11: `git reset --hard 529f3d9`, re-a
 
 ## 16. PR URL and commits
 
-See the PR (the URL is added after creation).
+https://github.com/majid-lotfian/job-hunter-agent/pull/12
 
 ## 17. Profile review checklist (`nano data/applicant_profile.yaml` on the VM)
 
