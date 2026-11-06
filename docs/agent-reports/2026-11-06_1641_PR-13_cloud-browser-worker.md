@@ -1,6 +1,6 @@
 # Cloud browser worker for unattended applications: real-browser CAPTCHA findings, Cloud Run design, PoC, shortlist
 
-- **PR:** #new (renamed after creation)
+- **PR:** [#13](https://github.com/majid-lotfian/job-hunter-agent/pull/13)
 - **Branch:** `feature/cloud-browser-worker` (from `main` d425b4e)
 - **Date:** 2026-11-06 16:41 (Europe/Amsterdam) · **Author:** Claude Code (Opus 5.5)
 - **Status:** open: not merged, not deployed, no cloud resources created. **No application was submitted.** No real employer form had anything typed into it.
@@ -283,4 +283,4 @@ New optional `.env` keys, all inert by default:
 
 ## 16. PR URL and commits
 
-See the PR description (URL added after creation).
+https://github.com/majid-lotfian/job-hunter-agent/pull/13 · commits: 3d778cb (implementation, tests, report), then this rename commit.
