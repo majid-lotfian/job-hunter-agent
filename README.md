@@ -1,8 +1,9 @@
-# Job Hunter Agent — self-hosted MVP
+# Job Hunter Agent — self-hosted AI job discovery, CV tailoring and application automation
 
 An open-source, low-resource job discovery and review assistant. It monitors **~70 employer career boards** (Greenhouse, Lever, Ashby, SmartRecruiters, Recruitee, Workable, Personio, Teamtailor; Workday opt-in) and **free job-board APIs** (Arbeitnow, The Muse, Himalayas, Jobicy, Remotive, Remote OK, Working Nomads; Adzuna/Jooble with optional keys) for AI/ML roles in the Netherlands, merges cross-source duplicates, scores matches, sends Telegram notifications, and exposes a lightweight FastAPI dashboard. For every new matching job (score ≥ `CV_MIN_SCORE`, default 70) a tailored HTML CV is **generated automatically** in the background from your private master CV with the Google Gemini API, validated, saved, and announced on Telegram for your review. An interactive Claude Code workflow remains available as an optional manual fallback.
 
-**Important limits:** This is a working MVP, not a universal job search engine. It does **not** search LinkedIn, Indeed, Glassdoor or other platforms that offer no permitted API (no scraping, no browser automation; see `docs/discovery/SOURCES.md`). It **never** submits applications (you review and approve every CV and apply yourself), does not generate cover letters, or calculate genuine ATS scores. The displayed score is a transparent rule-based relevance score. Telegram approval approves a *draft*, not an application submission. `applied` status must be recorded manually after confirmed external submission. No credentials are embedded in the code.
+**Current capabilities:** The agent discovers and ranks jobs, extracts applicant information from a private CV into a reviewable profile, tailors CVs to each vacancy without inventing experience, generates HTML/PDF documents, and offers Telegram/dashboard approval. For supported forms, an approved application can be completed and submitted by a Playwright browser worker, with confirmation checks and duplicate protection. **This is not a universal auto-apply tool:** platform support varies, CAPTCHA or login may block submission, and a successful click is not proof of employer receipt. Live submissions require explicit approval, a verified profile and opt-in configuration; `APPLY_MODE=off` is the default. See [Application modes and limitations](#application-modes-and-limitations). No commercial auto-apply subscription is needed, but GCP compute, APIs and storage may incur charges.
+
 
 ## Setup
 
@@ -20,9 +21,9 @@ cp .env.example .env
 
 **Do not expose port 8088 publicly.** See *Dashboard security* below.
 
-## Safe VM deployment, separate from price checker
+## Deploy as a separate service on a VM
 
-On the VM, use a separate directory, venv, and systemd unit. Do not modify the existing price-checker cron/service. A sample unit is provided in `deploy/job-hunter.service`; replace `YOUR_LINUX_USER` with your VM Linux username, copy it to `/etc/systemd/system/`, then enable/start. This does not require GitHub Actions or new GCP IAM permissions.
+On the VM, use a separate directory, venv, and systemd unit. Do not modify the existing price-checker cron/service. A sample unit is provided in `deploy/job-hunter.service`; replace `YOUR_LINUX_USER` with your VM Linux username, copy it to `/etc/systemd/system/`, then enable/start. The local browser backend does not require GitHub Actions or new GCP IAM permissions.
 
 For a local browser, create a tunnel from your machine using your existing SSH access, e.g. `gcloud compute ssh price-checker --zone=us-central1-a --project=vacation-price-checker --tunnel-through-iap -- -L 8088:127.0.0.1:8088` and open `http://127.0.0.1:8088`.
 
@@ -34,7 +35,7 @@ When discovery stores a new job with score ≥ `CV_MIN_SCORE` (default 70), it i
 2. Sends only the redacted `<body>` plus the job posting (marked as untrusted data) to Gemini, with strict rules: the master CV is the only source of facts; never invent skills, employers, titles, dates, achievements or metrics; keep all sections, employer/role/date lines and HTML structure. The CSS is not sent at all.
 3. **Restores** the original values locally and re-uses the master's `<head>`/`<style>` byte-for-byte, so styling, contact details and links are exactly as in your master CV.
 4. **Validates** the result. Gemini is asked for structured JSON output (`responseJsonSchema`, falling back to plain JSON mode if a model rejects the schema). Malformed, empty or truncated replies are never used: the model gets one correction round, then the job is retried with the normal bounded backoff. A CV is rejected (never saved) if it adds links, scripts, event handlers, forms or other active elements, changes the CSS or name, drops the e-mail link, mangles placeholders, drops or renames a section, changes or drops an employer/role/date line, is less than half the master's length, or tailored nothing (one correction round, then `failed`). It is saved but marked **needs review** if numbers or technical terms from the job posting are not found in the master CV, or the length changed a lot.
-5. Saves `data/cvs/job-<id>.html` (any previous file is backed up to `data/tailoring/job-<id>/`). After each batch, **one Telegram CV digest** lists every new outcome (ready / needs review / failed) with score, employer, review link and the job requirements your CV does not support. Approving/rejecting stays manual, and nothing is ever submitted.
+5. Saves `data/cvs/job-<id>.html` (any previous file is backed up to `data/tailoring/job-<id>/`). After each batch, **one Telegram CV digest** lists every new outcome (ready / needs review / failed) with score, employer, review link and the job requirements your CV does not support. Approving/rejecting stays manual; submission is possible only through the separately gated application workflow.
 
 ## Approvals and applications
 
@@ -46,7 +47,7 @@ When discovery stores a new job with score ≥ `CV_MIN_SCORE` (default 70), it i
 
 Telegram buttons and dashboard buttons call the same backend (`app/workflow.py`). Every decision is stored (`approvals`) and audited (`events`); an approval is bound to a version token of the job text and the CV file, so a changed job or CV never reuses an old approval. Callbacks are checked against `TELEGRAM_CHAT_ID` (and optionally `TELEGRAM_ALLOWED_USER_IDS`); repeated or stale presses do nothing. Individual actionable messages are capped per batch (`TELEGRAM_ACTIONS_PER_BATCH`); discovery stays a digest.
 
-**Application submission** (`app/applications/`) runs only after an explicit approval. States: `awaiting_cv`, `queued`, `submitting`, `submitted`, `confirmed`, `dry_run`, `manual_action_required`, `blocked`, `failed`, `cancelled`. One live application per job and per canonical apply URL; an interrupted submission is never retried automatically; a job becomes `applied` only with an external confirmation id. Personal data comes only from your private, verified `data/applicant_profile.yaml` (template: `applicant_profile.example.yaml`). **`APPLY_MODE=off` by default**: the agent checks readiness and sends you the direct application link. Research found no applicant-usable submission API for Greenhouse, Lever, Ashby, SmartRecruiters, Workable, Personio or Teamtailor (they require the employer's API key); the Recruitee adapter checks the public form requirements but is dry-run only. No CAPTCHA, login or anti-bot measure is ever bypassed.
+**Application submission** (`app/applications/`) runs only after an explicit approval. States: `awaiting_cv`, `queued`, `submitting`, `submitted`, `confirmed`, `dry_run`, `manual_action_required`, `blocked`, `failed`, `cancelled`. One live application per job and per canonical apply URL; an interrupted submission is never retried automatically; a job becomes `applied` only with an external confirmation id. Personal data comes only from your private, verified `data/applicant_profile.yaml` (template: `applicant_profile.example.yaml`). **`APPLY_MODE=off` by default**: the agent checks readiness and offers the supervised application flow. Most ATS submission APIs require employer credentials; the project also implements a browser-based Playwright worker for supported public application forms and a guarded Recruitee API adapter. See the detailed modes below. No CAPTCHA, login or anti-bot measure is ever bypassed.
 
 **Daily limit (optional):** `CV_DAILY_LIMIT` (default -1 = no fixed limit) automatic CVs per calendar day in `CV_TIMEZONE` (default Europe/Amsterdam), enforced in the database across restarts. Eligible jobs stay queued for the next days, highest score first, then newest posting. Each job uses at most one slot, even if Gemini errors force retries. Manual *Generate CV* / CLI requests are processed first and are not counted. A critical failure (e.g. invalid API key) sends one alert.
 
@@ -113,6 +114,188 @@ CV files created by older versions of this app (master copies / templates) show 
   - Submitted tokens are never logged, and any `token=` query value is redacted from uvicorn access logs.
 - **SSH tunnel / HTTP:** browsers (Chrome, Firefox, Edge) treat `http://localhost` and `http://127.0.0.1` as secure contexts, so the `Secure` cookie works through the tunnel at `http://localhost:8088`. If your browser refuses to keep the session over plain-HTTP localhost (some Safari versions), set `COOKIE_SECURE=false` in `.env` and restart. Traffic between your browser and the tunnel is plain HTTP on your own machine, and the SSH tunnel encrypts it in transit to the VM. Do not put the dashboard behind a public reverse proxy without HTTPS.
 
+
+## What the system does
+
+```text
+Private master CV + job preferences
+        |
+        +--> Applicant profile draft --> owner verifies personal/application answers
+        |
+Job discovery (employer ATS + permitted job APIs)
+        |
+Normalize, deduplicate, filter, score and rank
+        |
+Gemini: job-specific HTML CV (factual tailoring, PII redaction)
+        |
+Validation --> A4 PDF (WeasyPrint)
+        |
+Telegram notification / authenticated dashboard
+        |
+HUMAN GATE: inspect CV, answer screening questions, approve or reject
+        |
+Application orchestrator + SQLite audit/duplicate guards
+        |
+Supported ATS --> Playwright browser worker (local VM or optional Cloud Run Job)
+        |
+Fill + verify fields --> upload current PDF --> submit at most once
+        |
+Employer confirmation? --> record confirmed / blocked / uncertain; notify owner
+```
+
+The applicant profile is a **separate, owner-verified file**: CV extraction creates a draft, not authorization to invent missing details or silently answer screening questions. The approval gate prevents unsolicited submissions and gives the applicant an opportunity to catch CV mistakes. Telegram lets you review and approve from a phone, but a review link to the dashboard may require secure access to your VM.
+
+### Technology stack
+
+| Layer | Implementation |
+| --- | --- |
+| Backend and dashboard | Python, FastAPI, Uvicorn, Jinja2 |
+| Scheduling | APScheduler, periodic source scans |
+| Job sources | Greenhouse, Lever, Ashby, Recruitee and other configured ATS boards; permitted job APIs |
+| Job matching | Deterministic relevance rules in `search.yaml` (not an ATS score) |
+| LLM-based CV tailoring | Google Gemini REST API via `httpx`; factual safeguards and local PII restoration |
+| CV documents | HTML, WeasyPrint PDF rendering |
+| Application automation | Playwright/Chromium browser worker; limited Recruitee API adapter |
+| Workflow and audit | SQLite application state, approvals, events and duplicate prevention |
+| Notifications and approvals | Telegram Bot API and authenticated dashboard |
+| Hosting | Google Compute Engine VM with systemd; optional Cloud Run Jobs + private Cloud Storage for browser execution |
+
+## New user guide: Google Cloud VM to working agent
+
+This is a **self-hosted** application, not a hosted service. The steps below are a general deployment recipe; review the repository configuration and cloud pricing before enabling billable resources.
+
+### 1. Create a Google Cloud project and VM
+
+1. Sign in at [Google Cloud Console](https://console.cloud.google.com/), create or select a project, and enable billing if required.
+2. Enable the **Compute Engine API**. Open **Compute Engine → VM instances → Create instance**.
+3. Choose a region/zone convenient for you, a supported Linux image (Ubuntu or Debian), and a machine type. **e2-medium (4 GB RAM)** is a practical starting point if you intend to run Chromium and the app on the same VM; smaller machines may run out of memory. This machine type is **not guaranteed to be free-tier eligible**.
+4. Use an adequately sized persistent boot disk, enable SSH access, and **do not expose the dashboard port 8088 to the public internet**. Do not grant broad IAM roles or add unrelated firewall openings.
+5. Create the VM and connect using the Console **SSH** button. Keep track of the instance name, project ID, zone and Linux username.
+
+The project and VM names in examples elsewhere in this repository are from one deployment; replace them with **your own**. Stopping a VM interrupts scheduled discovery and Telegram polling; persistent disk normally survives a normal stop.
+
+### 2. Install prerequisites and clone the repository
+
+On your **Linux VM**:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git python3 python3-venv python3-pip libpango-1.0-0
+git clone https://github.com/majid-lotfian/job-hunter-agent.git
+cd job-hunter-agent
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+cp .env.example .env
+chmod 600 .env
+mkdir -p data
+```
+
+The PDF renderer needs compatible system libraries. If installation fails, consult the [WeasyPrint installation guide](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#installation). Browser automation also needs **Playwright and Chromium**, which are not installed by the base `requirements.txt`; see [Browser worker setup](#browser-worker-setup). Use a supported Python version and verify the test suite before deployment.
+
+### 3. Set up Gemini and Telegram
+
+**Gemini:** Create an API key in [Google AI Studio](https://aistudio.google.com/apikey). Put it in `.env` as `GEMINI_API_KEY`; keep `LLM_PROVIDER=gemini`. Confirm the selected `LLM_MODEL` is available to your key using `.venv/bin/python -m app.cv_pipeline --check`. API free-tier eligibility, quotas, model names and data-use terms can change.
+
+**Telegram:** Open [@BotFather](https://t.me/BotFather), create a bot with `/newbot`, and copy its token to `TELEGRAM_BOT_TOKEN`. Start a chat with your new bot; determine the numeric chat ID using Telegram's Bot API `getUpdates` method after sending the bot a message, then set `TELEGRAM_CHAT_ID`. Optionally restrict button presses with `TELEGRAM_ALLOWED_USER_IDS`. **Keep bot tokens, chat IDs and API keys private**; never commit `.env`. Only one running app instance should poll a given bot.
+
+**Dashboard:** Generate a strong random `DASHBOARD_TOKEN` and place it in `.env`. The dashboard listens on localhost by default. Set `APP_BASE_URL` only to an address you can access securely; a localhost-only URL will not open directly on a remote phone.
+
+### 4. Supply your CV, job preferences and applicant profile
+
+1. Copy your factual, current master **HTML** CV to `data/master_cv.html`. This is the tailoring source; the app does not directly accept an arbitrary PDF or DOCX as the master CV without conversion to the supported HTML format.
+2. Edit `search.yaml` for role titles, skills, target locations and scoring; review `discovery.yaml` to enable/disable sources and adjust scanning intervals.
+3. Create a **draft** applicant profile from your CV:
+
+```bash
+.venv/bin/python -m app.applications.profile --init-from-cv
+.venv/bin/python -m app.applications.profile --check
+```
+
+4. Open `data/applicant_profile.yaml` privately. Verify your name, email, phone, location, work authorization, links, languages and any other extracted values. Add answers to screening questions only when you know they are accurate and you agree to provide them. See `applicant_profile.example.yaml` for the schema. **Only after checking everything**, set `verified: true` and rerun `--check`.
+5. Do not commit `data/`, personal CVs, the SQLite database, tokens, or employer-specific applicant answers.
+
+### 5. Start locally on the VM and check health
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+.venv/bin/python -m app.cv_pipeline --check
+.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8088
+```
+
+In another SSH session, verify `curl http://127.0.0.1:8088/health`. Access the dashboard through an **SSH port-forward** from your own computer, using your own VM/project/zone:
+
+```bash
+gcloud compute ssh YOUR_VM --project=YOUR_PROJECT --zone=YOUR_ZONE -- -L 8088:127.0.0.1:8088
+```
+
+If your setup requires Identity-Aware Proxy tunneling, add `--tunnel-through-iap` before `--` and configure IAP permissions. Visit `http://127.0.0.1:8088` locally. **Do not open port 8088 to everyone.**
+
+### 6. Keep it running with systemd
+
+Edit `deploy/job-hunter.service`: replace **every** `YOUR_LINUX_USER` placeholder with your VM user and check the working directory. Then:
+
+```bash
+sudo cp deploy/job-hunter.service /etc/systemd/system/job-hunter.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now job-hunter.service
+sudo systemctl status job-hunter.service
+sudo journalctl -u job-hunter.service -n 100 --no-pager
+```
+
+Keep other services and their units unchanged. The service restarts on failure and starts on boot; it does not require an open SSH session.
+
+### 7. Use Telegram approvals
+
+With discovery enabled, the agent sends matches and tailored CV notifications. Review the job description and generated CV before selecting **Approve & Apply** or **Reject**. Approval is tied to the specific job/CV version; changed content requires fresh approval. For missing screening answers, inspect the authenticated application review page and complete your profile. You can keep `APPLY_MODE=off` indefinitely and submit manually.
+
+## Application modes and limitations
+
+| Mode | Behavior | Appropriate use |
+| --- | --- | --- |
+| `APPLY_MODE=off` | No automated live submission; readiness/review and manual application | Default and safest onboarding |
+| `APPLY_MODE=dry_run` | Prepare/test the application without clicking final Submit | Verify form support, PDF and fields |
+| `APPLY_MODE=live` | Permits actual submission **only** for approved jobs through explicitly enabled live adapters | Opt-in, after profile and CV review |
+
+A live browser application additionally requires `APPLY_LIVE_ADAPTERS=browser` and a configured `BROWSER_WORKER`. Never enable live mode just to test installation. The browser worker reads employer form requirements, fills known fields, checks values and file attachments, and clicks Submit **at most once** when permitted. Only an employer confirmation counts as success; blocked and uncertain outcomes are recorded without blindly retrying. No CAPTCHA solving, stealth bypass or unauthorized login automation is included.
+
+**Platform coverage is conditional:** discovery supports more sources than submission. The browser integration has been developed primarily for Greenhouse-style hosted forms and selected Recruitee forms; Ashby, Lever and other ATS may require additional form readers. Some employers add custom widgets, interactive CAPTCHA, login, consent forms, geographic restrictions or mandatory screening questions. A page loading successfully is not evidence that its submit-time bot checks will accept an application. Respect each employer's terms and do not send unwanted or duplicate applications.
+
+### Browser worker setup
+
+**Option A — run on the same VM (simplest with sufficient RAM):**
+
+The local worker requires a Python environment with the Playwright package and its Chromium browser. Install it **on the VM**, not on your personal laptop:
+
+```bash
+.venv/bin/python -m pip install playwright==1.63.0
+.venv/bin/python -m playwright install --with-deps chromium
+```
+
+Check the actual worker configuration in `app/applications/browser.py` and set `BROWSER_WORKER=local` in `.env`. If the worker uses a different interpreter, configure `BROWSER_WORKER_PYTHON` accordingly. Restart the service after changing `.env`. Test the browser worker against mock forms before any live run. The local option shares RAM/CPU with discovery and PDF generation.
+
+**Option B — isolated Cloud Run Job (advanced, potentially billable):**
+
+The repository includes `worker/Dockerfile`, `worker/setup_cloud_run.sh` and a cloud dispatcher. Review the script **before** running it from a checked-out repository in Google Cloud Shell. It provisions Cloud Run, Artifact Registry, Cloud Build, a private short-lived Cloud Storage bucket, service accounts and a **service-account key**. This creates cloud resources and may incur charges. Its example defaults are deployment-specific: override `PROJECT`, `REGION`, `BUCKET`, `JOB` as needed. Check organization policy and prefer keyless credentials where possible; if using the script's key, restrict permissions, store it outside Git and rotate/delete it when no longer needed. The cloud path was implemented but should be tested in your project before production use.
+
+After setup, configure `BROWSER_WORKER=cloud_run`, `BROWSER_WORKER_BUCKET`, `BROWSER_WORKER_JOB`, `BROWSER_WORKER_REGION`, and the isolated gcloud credential configuration on the VM. Cloud Run should run **one task with zero retries** so an ambiguous submission is never automatically duplicated.
+
+### Practical checklist before any real submission
+
+- Confirm the job is open and you genuinely want to apply.
+- Review the tailored HTML/PDF against your real work history; correct any unsupported claims.
+- Verify the private applicant profile and explicitly answer all required screening questions.
+- Confirm the form is supported and a dry run passes.
+- Approve the **specific** job/CV version through Telegram or the dashboard.
+- Enable the required live mode/adapter deliberately; monitor the result and disable live mode again if you only intended one application.
+- Treat `blocked` or `uncertain` as **not confirmed**, and check with the employer before trying again.
+
+## Cost, privacy and operating notes
+
+- **No subscription to an auto-apply SaaS is required.** Telegram bots can be created without a paid subscription, and some Gemini/Google Cloud services offer free quotas. However, a Compute Engine VM (especially e2-medium), persistent disk, egress, Cloud Run, Artifact Registry and paid API usage may cost money. Set budget alerts in Google Cloud Billing and check current pricing.
+- CV tailoring redacts personal identifiers before Gemini requests and restores them locally. An approved live application necessarily sends the required personal details and PDF to the employer. Keep `.env`, `data/` and credentials private, restrict VM access and back up the SQLite database securely.
+- The agent is not an ATS score predictor, does not guarantee interviews, and does not guarantee every employer accepts headless browser submissions.
+- For troubleshooting, inspect `sudo journalctl -u job-hunter.service -n 100 --no-pager`, `/health`, source-health dashboard, CV status CLI and application state; avoid sharing unredacted tokens, CVs or application screenshots publicly.
+
 ## Tests
 
 ```bash
@@ -146,6 +329,9 @@ Sources, coverage, research notes and limitations: `docs/discovery/SOURCES.md`. 
 - `app/cv_pipeline.py`: automatic CV generation: queue, background worker, redaction, validation, Telegram review notifications, CLI.
 - `app/llm.py`: configurable LLM provider (Gemini REST API via `httpx`; key from `.env`), error classification for retries.
 - `app/tailor_cv.py`: optional manual fallback: interactive Claude Code tailoring (prepare / finalize / list), shared CV validation.
+- `app/applications/`: supervised application preparation, verified applicant profiles, guarded submission adapters, browser dispatch and state machine.
+- `worker/`: Playwright browser worker, CAPTCHA probe, mock-form tests and optional Cloud Run packaging.
+- `app/pdf.py`: A4 PDF generation and validation of the current tailored HTML CV.
 - `app/main.py`: dashboard, API (serves CVs, queues generation; never generates during a request), hourly APScheduler scan, CV worker, Telegram long polling.
 - `data/master_cv.html`: private source HTML CV, required for CV generation (never commit).
 - `profile.yaml`: legacy template data; no longer used by the HTML CV generator.
