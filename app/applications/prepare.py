@@ -122,14 +122,30 @@ async def build_package(job, adapter, http, profile, cv, cv_version):
     if spec.available is None and (job['availability'] or 'active') == 'active':
         warnings.append(f"Vacancy status not confirmed by the employer's system; last seen by discovery {str(job['last_seen_at'] or '?')[:16]}.")
     missing = [r['label'] for r in rows if r['status'] == 'missing']
+    # fields the platform's documented submission API cannot carry (Recruitee: visible location choice)
+    unsupported = [r['label'] for r in rows if r['key'] == 'location_choice' and r['required']]
     questions = [r['label'] for r in rows if r['status'] == 'needs_answer']
     if not cv.get('pdf') and not any(r['source'] is None and r['kind'] == 'file' and r['label'] in missing
                                      and re.search(r'resume|\bcv\b', r['label'].lower()) for r in rows):
         missing.insert(0, 'Tailored CV PDF (missing, invalid or outdated)')
     if errors:
         missing.append('Verified applicant profile (' + '; '.join(errors)[:200] + ')')
+    blockers = []
+    if not adapter.live_capable:
+        blockers.append(f'{adapter.name}: no applicant-permitted submission API')
+    else:
+        if spec.available is not True:
+            blockers.append('vacancy not confirmed open')
+        if spec.captcha is not False:
+            blockers.append('employer form uses a CAPTCHA' if spec.captcha else 'CAPTCHA setting unknown')
+        if spec.consent_required is not False:
+            blockers.append('consent agreement required' if spec.consent_required else 'consent setting unknown')
+        blockers += [f'{label} has no documented API field' for label in unsupported]
+    if missing or questions or not cv.get('pdf') or errors:
+        blockers.append('missing information or unanswered questions')
     return {
         'prepared_at': now_iso(),
+        'autonomous': {'possible': not blockers, 'blockers': blockers},
         'job': {'id': job['id'], 'title': job['title'], 'employer': job['employer'] or job['company'],
                 'location': job['location_label'] or job['location'], 'score': job['score'], 'url': job['url']},
         'apply_page': spec.apply_page or job['apply_url'] or job['url'],
