@@ -1,0 +1,36 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Apply - Mock Greenhouse</title></head><body>
+<h1>Senior ML Engineer (mock)</h1>
+<form id="f" novalidate>
+  <label for="first_name">First Name *</label><input id="first_name" name="first_name" required>
+  <label for="last_name">Last Name *</label><input id="last_name" name="last_name" required>
+  <label for="email">Email *</label><input id="email" name="email" type="email" required>
+  <label for="phone">Phone *</label><input id="phone" name="phone" type="tel" required>
+  <label for="resume">Resume/CV *</label><input id="resume" name="resume" type="file" accept=".pdf" required>
+  <label for="q10">Are you currently authorized to work in the country where this position is located? *</label>
+  <select id="q10" name="q10" required><option value="">Select...</option><option>Yes</option><option>No</option></select>
+  <fieldset><legend>Which languages do you speak?</legend>
+    <label><input type="checkbox" name="lang" value="en">English</label>
+    <label><input type="checkbox" name="lang" value="nl">Dutch</label>
+    <label><input type="checkbox" name="lang" value="de">German</label></fieldset>
+  <button type="submit">Submit application</button>
+</form>
+<script>
+const mode = new URLSearchParams(location.search).get('mode') || 'ok';
+document.getElementById('f').addEventListener('submit', ev => {
+  ev.preventDefault();
+  window.__submits = (window.__submits || 0) + 1;
+  const missing = [...document.querySelectorAll('[required]')].filter(el => el.type === 'file' ? !el.files.length : !el.value);
+  if (mode === 'invalid' || missing.length) {
+    (missing.length ? missing : [document.getElementById('phone')]).forEach(el => el.setAttribute('aria-invalid', 'true'));
+    const e = document.createElement('div'); e.className = 'error'; e.textContent = 'Please correct the highlighted fields'; document.body.append(e);
+    return;
+  }
+  if (mode === 'challenge') {   // what a visible hCaptcha challenge looks like to the page
+    const fr = document.createElement('iframe'); fr.title = 'Main content of the hCaptcha challenge';
+    fr.srcdoc = '<p>Please click each image containing a bus</p>'; fr.width = 400; fr.height = 520; document.body.append(fr);
+    return;
+  }
+  if (mode === 'silent') return;   // nothing happens: no confirmation
+  document.body.innerHTML = '<h1>Thank you for applying!</h1><p>Your application has been received. Reference GH-4711.</p>';
+});
+</script></body></html>

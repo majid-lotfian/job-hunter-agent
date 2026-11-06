@@ -1,0 +1,53 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Job Application - Mock Greenhouse (react-select)</title>
+<style>.select__menu{border:1px solid #888}.select__option{padding:4px}.select__control{border:1px solid #ccc;min-height:30px;position:relative}
+.select__control input{border:0;outline:0;width:60%}</style></head><body>
+<!-- Mirrors the structure of real job-boards.greenhouse.io forms (2026-11): single-choice questions are ARIA comboboxes
+     (react-select), multi-select questions are checkbox lists; a Cloudflare Turnstile widget can sit in a closed shadow root. -->
+<h1>(Senior) ML Developer (mock)</h1>
+<form id="f" novalidate>
+  <label for="first_name">First Name<span>*</span></label><input id="first_name" type="text" required aria-required="true">
+  <label for="last_name">Last Name<span>*</span></label><input id="last_name" type="text" required aria-required="true">
+  <label for="email">Email<span>*</span></label><input id="email" type="text" required aria-required="true">
+  <div class="file-upload"><div id="upload-label-resume">Resume/CV<span>*</span></div>
+    <label for="resume">Attach</label><input id="resume" type="file" aria-labelledby="upload-label-resume"></div>
+  <div class="select"><label for="question_1">How did you hear about this role?<span>*</span></label>
+    <div class="select__control"><div class="select__value"></div>
+      <input id="question_1" type="text" role="combobox" aria-expanded="false" aria-required="true" autocomplete="off"></div></div>
+  <div class="checkbox-group" id="question_2"><label>Which is your preferred location for this role?<span>*</span></label>
+    <div><input type="checkbox" id="loc_ams" name="loc" required><label for="loc_ams">Amsterdam, Netherlands</label></div>
+    <div><input type="checkbox" id="loc_ber" name="loc" required><label for="loc_ber">Berlin, Germany</label></div></div>
+  <div id="ts-host"></div>
+  <button type="submit">Submit application</button>
+</form>
+<script>
+const params = new URLSearchParams(location.search);
+const OPTIONS = ['Google search', "JetBrains' website", 'Saw a LinkedIn job posting (Jobs section)', 'Event'];
+const input = document.getElementById('question_1'), control = input.parentElement, value = control.querySelector('.select__value');
+let chosen = '';
+input.addEventListener('mousedown', () => setTimeout(openMenu, 30));
+input.addEventListener('click', () => setTimeout(openMenu, 30));
+function openMenu() {
+  if (document.querySelector('.select__menu')) return;
+  const menu = document.createElement('div'); menu.className = 'select__menu'; menu.setAttribute('role', 'listbox');
+  OPTIONS.forEach(o => { const d = document.createElement('div'); d.className = 'select__option'; d.setAttribute('role', 'option');
+    d.textContent = o; d.addEventListener('click', () => { chosen = o; value.textContent = o; menu.remove(); input.setAttribute('aria-expanded', 'false'); });
+    menu.append(d); });
+  control.after(menu); input.setAttribute('aria-expanded', 'true');
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { const m = document.querySelector('.select__menu'); if (m) m.remove(); } });
+const ts = params.get('turnstile');           // block = widget waits for a click; pass = widget already passed silently
+if (ts) {
+  const root = document.getElementById('ts-host').attachShadow({mode: 'closed'});
+  const fr = document.createElement('iframe'); fr.src = '/challenges.cloudflare.com/widget.html'; fr.width = 300; fr.height = 65;
+  root.append(fr);
+  const tok = document.createElement('input'); tok.type = 'hidden'; tok.name = 'cf-turnstile-response';
+  tok.value = ts === 'pass' ? 'x'.repeat(48) : ''; document.getElementById('f').append(tok);
+}
+document.getElementById('f').addEventListener('submit', ev => {
+  ev.preventDefault();
+  const ok = ['first_name', 'last_name', 'email'].every(id => document.getElementById(id).value) && chosen
+    && document.getElementById('resume').files.length && document.querySelector('input[name=loc]:checked');
+  if (!ok) { const e = document.createElement('div'); e.setAttribute('role', 'alert'); e.textContent = 'Please complete all required fields'; document.body.append(e); return; }
+  document.body.innerHTML = '<h1>Thank you for applying!</h1><p>Your application has been submitted.</p>';
+});
+</script></body></html>

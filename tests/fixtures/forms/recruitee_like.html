@@ -1,0 +1,15 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Apply - Mock Recruitee</title></head><body>
+<form id="f">
+  <label for="name">Full name</label><input id="name" name="candidate[name]" required>
+  <label for="email">Email</label><input id="email" name="candidate[email]" type="email" required>
+  <label for="phone">Phone</label><input id="phone" name="candidate[phone]" type="tel" required>
+  <label for="cv">CV</label><input id="cv" name="candidate[cv]" type="file" required>
+  <fieldset><legend>Do you hold a valid work permit?</legend>
+    <label><input type="radio" name="q11" value="1">Yes</label><label><input type="radio" name="q11" value="0">No</label></fieldset>
+  <button type="submit">Send</button>
+</form>
+<script>
+document.getElementById('f').addEventListener('submit', ev => { ev.preventDefault(); window.__submits = (window.__submits || 0) + 1;
+  history.pushState({}, '', '/o/ai-engineer/c/new/thank-you');
+  document.body.innerHTML = '<h2>Bedankt voor je sollicitatie!</h2><p>We nemen snel contact op.</p>'; });
+</script></body></html>

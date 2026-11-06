@@ -142,18 +142,33 @@ async def process(app_id, http, cfg=None):
         return finish('blocked', 'The vacancy is no longer open - nothing was submitted.', detail=detail)
     if plan.status == adapters.BLOCKED:
         return finish(plan.status, plan.message, detail=detail)
+    # 4b. on-demand cloud browser worker: only when the owner enabled it, the API path is not available and the
+    #     package is complete (app/applications/browser.py). It stops at any login or human-verification challenge.
+    from . import browser
+    via_browser = False
+    if cfg['mode'] == 'live' and 'browser' in cfg['live_adapters'] and browser.settings()['backend'] \
+            and not package.get('autonomous', {}).get('possible') and plan.status != adapters.BLOCKED:
+        via_browser, reasons = browser.eligibility(job, package)
+        detail['browser'] = {'eligible': via_browser, 'reasons': reasons}
     # 5. mode gates - nothing leaves the VM unless live mode + live-capable adapter + explicitly allowed + a form that
     #    permits autonomous submission (no CAPTCHA, no consent agreement, every required field known)
-    if plan.status == adapters.MANUAL or cfg['mode'] == 'off' or package['captcha'] \
-            or not package.get('autonomous', {}).get('possible'):
+    if not via_browser and (plan.status == adapters.MANUAL or cfg['mode'] == 'off' or package['captcha']
+                            or not package.get('autonomous', {}).get('possible')):
         detail.update(prepared=True, missing=package['missing'] + package['questions'])
         return finish('manual_action_required', prepared_message(package, plan.message if plan.status == adapters.MANUAL else None),
                       detail=detail)
-    if cfg['mode'] == 'dry_run' or not adapter.live_capable or adapter.name not in cfg['live_adapters']:
+    if not via_browser and (cfg['mode'] == 'dry_run' or not adapter.live_capable or adapter.name not in cfg['live_adapters']):
         detail['prepared'] = True
         return finish('dry_run', f'Dry run OK via {adapter.name} - nothing was submitted. Apply manually.', detail=detail)
-    # 6. live submission
-    result = await adapter.submit(http, job, profile, cv, plan)
+    # 6. live submission (exactly one attempt; the application is in 'submitting', so a crash is never resent)
+    if via_browser:
+        method = 'browser'
+        with connect() as db:
+            db.execute('UPDATE applications SET adapter=? WHERE id=?', ('browser', app_id))
+        result = await browser.submit(app, job, package, cv)
+    else:
+        method = adapter.name
+        result = await adapter.submit(http, job, profile, cv, plan)
     if result.status in (adapters.SUBMITTED, adapters.CONFIRMED) and result.external_id:
         stamp = now_iso()
         status = finish(result.status, result.message or 'Submitted', external_id=result.external_id, submitted_at=stamp,
@@ -161,7 +176,7 @@ async def process(app_id, http, cfg=None):
         with connect() as db:
             db.execute("UPDATE approvals SET status='consumed', consumed_at=? WHERE id=?", (stamp, approval['id']))
         try:
-            transition(job['id'], 'applied', f'Submitted via {adapter.name}; confirmation {result.external_id}')
+            transition(job['id'], 'applied', f'Submitted via {method}; confirmation {result.external_id}')
         except ValueError as exc:
             log.warning('Could not mark job %s applied: %s', job['id'], exc)
         return status
