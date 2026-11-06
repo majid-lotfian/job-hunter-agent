@@ -15,9 +15,18 @@ background worker (started by app.main) then, one job at a time:
 At most CV_DAILY_LIMIT (default 5) automatic CVs are started per local calendar day (CV_TIMEZONE, default
 Europe/Amsterdam); the rest stay queued for the next days, highest score first. Manual requests do not count.
 
-Status per job (table cv_jobs): pending -> generating -> ready | needs_review | failed.
-Temporary API failures are retried with bounded exponential backoff. ready and
-needs_review CVs are never regenerated automatically. Nothing is ever submitted to an
+Status per job (table cv_jobs): pending -> generating -> ready | needs_review | failed | waiting_retry.
+
+Temporary Gemini failures (429 rate limit, 5xx overload, timeouts, network) are retried with exponential
+backoff plus jitter, honouring Retry-After / RetryInfo (CV_RETRY_BASE_SECONDS, capped by CV_RETRY_MAX_SECONDS).
+After CV_MAX_ATTEMPTS such failures the job is NOT failed: it moves to waiting_retry with next_attempt_at set
+after a longer cooldown (CV_WAIT_RETRY_BASE_SECONDS, ~10 min, doubling per cycle up to CV_WAIT_RETRY_MAX_SECONDS)
+and starts a fresh cycle when due. Only after CV_RETRY_GIVE_UP_HOURS of uninterrupted transient failures does it
+fail. Model-wide signals (429/5xx) also set a shared, persistent cooldown (table llm_state) so no worker hammers
+an overloaded model. Malformed/empty replies keep the bounded behaviour (fail after CV_MAX_ATTEMPTS); permanent
+errors (blocked prompt, invalid request, failed validation) fail at once; configuration errors (401/403/404)
+halt the worker until restart or a manual retry. waiting_retry produces no Telegram message; only a final
+failure is announced (once, in the failure digest). ready and needs_review CVs are never regenerated automatically. Nothing is ever submitted to an
 employer; approving and applying stay manual.
 
 CLI (on the VM, project directory):
@@ -29,7 +38,7 @@ CLI (on the VM, project directory):
 """
 import argparse
 import asyncio
-import time
+import random
 import html
 import json
 import os
@@ -46,8 +55,13 @@ from .core import (ROOT, connect, cv_path, dashboard_base, get_cv_job, get_job, 
                    now_iso, send_telegram, set_cv_job)
 from .tailor_cv import GENERATOR, MARKER, MASTER, WORKSPACES, validate_draft
 
-STATUSES = ('pending', 'generating', 'ready', 'failed', 'needs_review')
+STATUSES = ('pending', 'generating', 'waiting_retry', 'ready', 'failed', 'needs_review')
 DONE = ('ready', 'needs_review')
+QUEUED = ('pending', 'waiting_retry')            # claimable once next_attempt_at is due
+# Temporary error kinds that mean "the service is busy", not "this request is bad": they never fail a job
+# after CV_MAX_ATTEMPTS, they move it to waiting_retry. Malformed/empty replies stay bounded.
+WAITABLE_KINDS = ('overload', 'rate_limit', 'quota_daily', 'timeout', 'network', 'temporary')
+SHARED_KINDS = ('overload', 'rate_limit', 'quota_daily')   # model-wide: pause every worker
 MAX_JOB_DESCRIPTION = 15000
 
 
@@ -63,8 +77,12 @@ def settings():
         'auto': os.getenv('CV_AUTO_GENERATE', 'true').strip().lower() not in ('0', 'false', 'no'),
         'min_score': _env_int('CV_MIN_SCORE', 70),
         'max_attempts': max(1, _env_int('CV_MAX_ATTEMPTS', 5)),
-        'retry_base': max(1, _env_int('CV_RETRY_BASE_SECONDS', 60)),
-        'retry_max': max(1, _env_int('CV_RETRY_MAX_SECONDS', 6 * 3600)),
+        'retry_base': max(1, _env_int('CV_RETRY_BASE_SECONDS', 30)),      # within a cycle: 30s, 60s, 120s, ...
+        'retry_max': max(1, _env_int('CV_RETRY_MAX_SECONDS', 900)),
+        'wait_base': max(60, _env_int('CV_WAIT_RETRY_BASE_SECONDS', 600)),  # waiting_retry: ~10 min, doubling
+        'wait_max': max(60, _env_int('CV_WAIT_RETRY_MAX_SECONDS', 6 * 3600)),
+        'give_up_hours': max(0, _env_int('CV_RETRY_GIVE_UP_HOURS', 72)),    # 0 = keep retrying transient errors
+        'overload_cooldown_max': max(30, _env_int('LLM_OVERLOAD_COOLDOWN_MAX_SECONDS', 900)),
         'min_interval': max(0, _env_int('LLM_MIN_INTERVAL_SECONDS', 15)),
         'poll': max(5, _env_int('CV_WORKER_POLL_SECONDS', 60)),
         'config_pause': max(30, _env_int('CV_CONFIG_ERROR_PAUSE_SECONDS', 1800)),
@@ -115,11 +133,80 @@ class BudgetExhausted(Exception):
     """The daily LLM request budget is used up; the job waits (not the job's fault)."""
 
 
-_cooldown = {'until': 0.0, 'reason': None}   # process-wide pause after a provider rate limit
+# --------------------------------------------------------------------------- shared cooldown (persistent)
+
+def _state_get(db, key):
+    row = db.execute('SELECT value FROM llm_state WHERE key=?', (key,)).fetchone()
+    return row['value'] if row else None
 
 
-def rate_limited_until():
-    return _cooldown['until']
+def _state_set(db, key, value):
+    db.execute('INSERT INTO llm_state (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET '
+               'value=excluded.value, updated_at=excluded.updated_at', (key, None if value is None else str(value), now_iso()))
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
+def cooldown_remaining():
+    """Seconds left on the shared model cooldown (0 if none). Stored as wall-clock time, so it survives restarts."""
+    with connect() as db:
+        until = _state_get(db, 'cooldown_until')
+    if not until:
+        return 0
+    try:
+        return max(0, int((datetime.fromisoformat(until) - _utcnow()).total_seconds()))
+    except ValueError:
+        return 0
+
+
+def cooldown_reason():
+    with connect() as db:
+        return _state_get(db, 'cooldown_reason')
+
+
+def clear_cooldown():
+    with connect() as db:
+        _state_set(db, 'cooldown_until', None)
+        _state_set(db, 'overload_streak', 0)
+
+
+def _jitter(low, high):
+    return random.uniform(low, high)
+
+
+def note_model_busy(exc, cfg):
+    """A model-wide temporary error (429/5xx): extend the shared cooldown. Consecutive hits (across jobs and
+    restarts) double it, with jitter, up to LLM_OVERLOAD_COOLDOWN_MAX_SECONDS; Retry-After wins if longer.
+    Returns the pause in seconds."""
+    kind = getattr(exc, 'kind', 'temporary')
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        streak = int(_state_get(db, 'overload_streak') or 0) + 1
+        pause = min(cfg['overload_cooldown_max'], cfg['retry_base'] * 2 ** (streak - 1)) * _jitter(0.8, 1.2)
+        if kind == 'rate_limit':
+            pause = max(pause, cfg['rate_limit_cooldown'])
+        elif kind == 'quota_daily':
+            pause = max(pause, 3600)          # per-day quota: no point asking again soon
+        pause = max(pause, min(cfg['wait_max'], exc.retry_after or 0))
+        until = _utcnow() + timedelta(seconds=pause)
+        current = _state_get(db, 'cooldown_until')
+        try:
+            if current and datetime.fromisoformat(current) > until:
+                until = datetime.fromisoformat(current)
+        except ValueError:
+            pass
+        _state_set(db, 'overload_streak', streak)
+        _state_set(db, 'cooldown_until', until.isoformat())
+        _state_set(db, 'cooldown_reason', f'{kind}: {str(exc)[:200]}')
+    return int(pause)
+
+
+def note_model_ok():
+    with connect() as db:
+        if int(_state_get(db, 'overload_streak') or 0):
+            _state_set(db, 'overload_streak', 0)
 
 
 def quota_status(cfg=None):
@@ -129,12 +216,13 @@ def quota_status(cfg=None):
         used = db.execute('SELECT COUNT(*) FROM cv_jobs WHERE quota_day=?', (day,)).fetchone()[0]
         waiting = db.execute(f"SELECT COUNT(*) FROM cv_jobs WHERE status='pending' AND reason IN "
                              f"({','.join('?' * len(AUTO_REASONS))}) AND quota_day IS NULL", AUTO_REASONS).fetchone()[0]
+        retrying = db.execute("SELECT COUNT(*) FROM cv_jobs WHERE status='waiting_retry'").fetchone()[0]
     limit = cfg['daily_limit']
     return {'day': day, 'timezone': cfg['timezone'], 'daily_limit': limit, 'used_today': used,
             'remaining_today': None if limit < 0 else max(0, limit - used), 'queued_automatic': waiting,
             'llm_requests_today': llm_requests_today(cfg), 'llm_daily_budget': cfg['llm_daily_budget'],
-            'concurrency': cfg['concurrency'],
-            'rate_limited_for_seconds': max(0, int(_cooldown['until'] - time.monotonic()))}
+            'concurrency': cfg['concurrency'], 'waiting_retry': retrying,
+            'rate_limited_for_seconds': cooldown_remaining()}
 
 
 class PipelineError(Exception):
@@ -465,8 +553,24 @@ async def generate(job, provider, max_rounds=2):
 
 
 def backoff_seconds(attempt, cfg, retry_after=None):
-    delay = min(cfg['retry_max'], cfg['retry_base'] * 4 ** max(0, attempt - 1))
-    return max(delay, min(cfg['retry_max'], retry_after or 0))
+    """Within a cycle: exponential (base * 2^(n-1)) with jitter (50-100% of it), capped at CV_RETRY_MAX_SECONDS.
+    A provider Retry-After is honoured if longer (capped at CV_WAIT_RETRY_MAX_SECONDS)."""
+    delay = min(cfg['retry_max'], cfg['retry_base'] * 2 ** max(0, attempt - 1)) * _jitter(0.5, 1.0)
+    return int(max(1, delay, min(cfg['wait_max'], retry_after or 0)))
+
+
+def wait_retry_seconds(cycle, cfg, retry_after=None):
+    """Cooldown before a waiting_retry job starts its next cycle: ~CV_WAIT_RETRY_BASE_SECONDS (+-20% jitter),
+    doubling per cycle up to CV_WAIT_RETRY_MAX_SECONDS; Retry-After is honoured if longer."""
+    delay = min(cfg['wait_max'], cfg['wait_base'] * 2 ** max(0, cycle - 1)) * _jitter(0.8, 1.2)
+    return int(max(delay, min(cfg['wait_max'], retry_after or 0)))
+
+
+def _hours_since(iso):
+    try:
+        return (_utcnow() - datetime.fromisoformat(iso)).total_seconds() / 3600
+    except (TypeError, ValueError):
+        return 0.0
 
 
 async def process(job_id, provider, cfg=None):
@@ -493,17 +597,7 @@ async def process(job_id, provider, cfg=None):
                    **({'quota_day': None} if refund else {}))
         raise
     except llm.TemporaryLLMError as exc:
-        if row['attempts'] >= cfg['max_attempts']:
-            return await _failed(job, f'Gave up after {row["attempts"]} attempts: {exc}')
-        delay = backoff_seconds(row['attempts'], cfg, exc.retry_after)
-        if '429' in str(exc) or 'RESOURCE_EXHAUSTED' in str(exc):  # provider rate limit: pause ALL workers
-            pause = max(cfg['rate_limit_cooldown'], exc.retry_after or 0)
-            _cooldown.update(until=time.monotonic() + pause, reason=str(exc)[:200])
-            log.warning('Gemini rate limit: pausing CV generation for %ss', pause)
-        retry_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
-        set_cv_job(job_id, 'pending', last_error=f'Temporary: {exc}', next_attempt_at=retry_at)
-        log.warning('CV for job %s: temporary LLM error, retry in %ss (%s)', job_id, delay, exc)
-        return 'pending'
+        return await _temporary_failure(job, row, provider, exc, cfg)
     except (llm.PermanentLLMError, ValueError) as exc:
         return await _failed(job, str(exc))
 
@@ -517,9 +611,46 @@ async def process(job_id, provider, cfg=None):
     status = 'needs_review' if warnings else 'ready'
     set_cv_job(job_id, status, source=provider.name, model=provider.model, last_error=None,
                next_attempt_at=None, warnings='\n'.join(warnings) or None, notes=json.dumps(notes),
-               completed_at=now_iso(), notified_at=None)  # announced in the next CV digest
+               completed_at=now_iso(), notified_at=None,  # announced in the next CV digest
+               retry_cycle=0, transient_since=None, last_error_kind=None)
+    note_model_ok()
     log.info('CV for job %s: %s (%d warning(s))', job_id, status, len(warnings))
     _cv_finished(job_id, status)
+    return status
+
+
+async def _temporary_failure(job, row, provider, exc, cfg):
+    """Schedule the retry of a temporary failure; never loses the job for a busy/overloaded model."""
+    job_id = job['id']
+    kind = getattr(exc, 'kind', 'temporary')
+    model = getattr(provider, 'model', '?')
+    since = row['transient_since'] or now_iso()
+    attempts = row['attempts']
+    if kind in SHARED_KINDS:
+        pause = note_model_busy(exc, cfg)
+        log.warning('Gemini %s busy (%s): shared cooldown %ss for all CV workers', model, kind, pause)
+    if kind not in WAITABLE_KINDS:     # malformed / empty replies: bounded, as before
+        if attempts >= cfg['max_attempts']:
+            return await _failed(job, f'Gave up after {attempts} attempts: {exc}')
+        delay, status, cycle = backoff_seconds(attempts, cfg, exc.retry_after), 'pending', row['retry_cycle'] or 0
+    elif cfg['give_up_hours'] and _hours_since(since) >= cfg['give_up_hours']:
+        return await _failed(job, f'Gave up after {cfg["give_up_hours"]}h of temporary errors '
+                                  f'({(row["retry_cycle"] or 0) + 1} retry cycle(s)): {exc}')
+    elif attempts >= cfg['max_attempts']:
+        cycle = (row['retry_cycle'] or 0) + 1
+        delay, status = wait_retry_seconds(cycle, cfg, exc.retry_after), 'waiting_retry'
+        attempts = 0    # the next claim starts a fresh cycle of CV_MAX_ATTEMPTS
+    else:
+        delay, status, cycle = backoff_seconds(attempts, cfg, exc.retry_after), 'pending', row['retry_cycle'] or 0
+    retry_at = (_utcnow() + timedelta(seconds=delay)).isoformat()
+    set_cv_job(job_id, status, attempts=attempts, retry_cycle=cycle, transient_since=since, last_error_kind=kind,
+               last_error=f'Temporary ({kind}): {exc}', next_attempt_at=retry_at)
+    if status == 'waiting_retry':
+        log.warning('CV for job %s: %s after %s attempts on %s; waiting_retry cycle %s, next try in %ss (%s)',
+                    job_id, kind, row['attempts'], model, cycle, delay, exc)
+    else:
+        log.warning('CV for job %s: temporary %s error on %s (attempt %s/%s), retry in %ss (%s)',
+                    job_id, kind, model, row['attempts'], cfg['max_attempts'], delay, exc)
     return status
 
 
@@ -532,7 +663,8 @@ def _cv_finished(job_id, status):
 
 
 async def _failed(job, message):
-    set_cv_job(job['id'], 'failed', last_error=message[:1000], next_attempt_at=None, completed_at=now_iso(), notified_at=None)
+    set_cv_job(job['id'], 'failed', last_error=message[:1000], next_attempt_at=None, completed_at=now_iso(), notified_at=None,
+               retry_cycle=0, transient_since=None)
     log.error('CV for job %s failed: %s', job['id'], message)
     _cv_finished(job['id'], 'failed')
     return 'failed'
@@ -573,6 +705,8 @@ async def send_cv_digest(cfg=None):
             break
         lines.append(line)
     q = quota_status(cfg)
+    if q['waiting_retry']:
+        lines.append(f"Waiting to retry automatically (temporary Gemini errors): {q['waiting_retry']}")
     if q['queued_automatic']:
         limit = 'unlimited' if q['daily_limit'] < 0 else f"{q['used_today']}/{q['daily_limit']} used today"
         lines.append(f"Queued for automatic CVs: {q['queued_automatic']} (daily limit: {limit})")
@@ -599,8 +733,11 @@ def enqueue(job_id, reason='new', force=False):
         return row['status']
     if row and row['status'] == 'pending' and not force:
         return 'pending'
+    if row and row['status'] == 'waiting_retry' and reason in AUTO_REASONS and not force:
+        return 'waiting_retry'   # automatic re-queueing never skips the cooldown; a manual request does
     set_cv_job(job_id, 'pending', reason='regenerate' if force else reason, attempts=0,
-               next_attempt_at=None, last_error=None, warnings=None)
+               next_attempt_at=None, last_error=None, warnings=None, retry_cycle=0, transient_since=None,
+               last_error_kind=None)
     return 'pending'
 
 
@@ -637,8 +774,8 @@ def claim_next(cfg=None):
     Automatic jobs are only claimed while today's CV_DAILY_LIMIT has room; the first claim of an automatic
     job records the local day (one quota slot per job, never again for its retries)."""
     cfg = cfg or settings()
-    if time.monotonic() < _cooldown['until'] or not llm_budget_left(cfg):
-        return None  # rate-limited or daily LLM budget used up: everything waits, nothing is lost
+    if cooldown_remaining() > 0 or not llm_budget_left(cfg):
+        return None  # model busy (shared cooldown) or daily LLM budget used up: everything waits, nothing is lost
     now, day, limit = now_iso(), local_day(cfg), cfg['daily_limit']
     manual = ','.join(f"'{r}'" for r in MANUAL_REASONS)
     with connect() as db:
@@ -646,7 +783,7 @@ def claim_next(cfg=None):
         used = db.execute('SELECT COUNT(*) FROM cv_jobs WHERE quota_day=?', (day,)).fetchone()[0]
         auto_ok = 1 if (limit < 0 or used < limit) else 0
         row = db.execute(f"""SELECT c.job_id, c.reason, c.quota_day FROM cv_jobs c JOIN jobs j ON j.id=c.job_id
-                             WHERE c.status='pending' AND (c.next_attempt_at IS NULL OR c.next_attempt_at<=?)
+                             WHERE c.status IN ('pending','waiting_retry') AND (c.next_attempt_at IS NULL OR c.next_attempt_at<=?)
                                AND (c.reason IN ({manual}) OR c.quota_day IS NOT NULL OR ?)
                              ORDER BY CASE c.reason WHEN 'approved' THEN 0 WHEN 'manual' THEN 1 WHEN 'regenerate' THEN 1 ELSE 2 END,
                                       j.score DESC,
@@ -656,14 +793,14 @@ def claim_next(cfg=None):
             return None
         consume = row['reason'] not in MANUAL_REASONS and row['quota_day'] is None
         claimed = db.execute("UPDATE cv_jobs SET status='generating', attempts=attempts+1, updated_at=?, "
-                             "quota_day=CASE WHEN ? THEN ? ELSE quota_day END WHERE job_id=? AND status='pending'",
+                             "quota_day=CASE WHEN ? THEN ? ELSE quota_day END WHERE job_id=? AND status IN ('pending','waiting_retry')",
                              (now, consume, day, row['job_id'])).rowcount
     return row['job_id'] if claimed else None
 
 
 def claim_next_exists():
     with connect() as db:
-        return bool(db.execute("SELECT 1 FROM cv_jobs WHERE status='pending' LIMIT 1").fetchone())
+        return bool(db.execute("SELECT 1 FROM cv_jobs WHERE status IN ('pending','waiting_retry') LIMIT 1").fetchone())
 
 
 def cv_state(job_id, row=None):
@@ -673,7 +810,10 @@ def cv_state(job_id, row=None):
     if row is None:
         status = 'legacy' if path.exists() and not has_marker(path) else ('ready' if path.exists() else 'none')
         return {'cv_status': status, 'cv_error': None, 'cv_warnings': [], 'cv_has_file': path.exists()}
-    return {'cv_status': row['status'], 'cv_error': row['last_error'],
+    error = row['last_error']
+    if row['status'] == 'waiting_retry' and row['next_attempt_at']:
+        error = f"{error or 'Temporary error'} — retrying automatically after {row['next_attempt_at'][:16].replace('T', ' ')} UTC"
+    return {'cv_status': row['status'], 'cv_error': error, 'next_retry_at': row['next_attempt_at'] if row['status'] in QUEUED else None,
             'cv_warnings': (row['warnings'] or '').splitlines(), 'cv_has_file': path.exists()}
 
 
@@ -686,6 +826,7 @@ class CVWorker:
         self.provider_factory = provider_factory
         self.wake = asyncio.Event()
         self.paused_reason = None
+        self.halted_reason = None    # API said the key/model is wrong: no more calls until restart or manual retry
         self._alerted_reason = None
         self._last_request = 0.0
         self._pace_lock = asyncio.Lock()
@@ -708,12 +849,15 @@ class CVWorker:
 
     def request(self, job_id):
         status = enqueue(job_id, 'manual')
+        self.halted_reason = None    # an explicit request is the owner's "try again"
         self.wake.set()
         return status
 
     async def run_once(self):
         """Process one due job. Returns True if a job was processed."""
         cfg = settings()
+        if self.halted_reason:
+            return False
         try:
             provider = self.provider_factory()
         except llm.ConfigurationLLMError as exc:
@@ -732,7 +876,13 @@ class CVWorker:
         try:
             await process(job_id, provider, cfg)
             self.paused_reason = None
-        except (llm.ConfigurationLLMError, PipelineError) as exc:
+        except llm.ConfigurationLLMError as exc:
+            # 401/403/404 from the API: the key or model is wrong. Retrying cannot help (.env is only read at
+            # start), so stop calling Gemini until the service restarts or you press Retry in the dashboard.
+            self.paused_reason = self.halted_reason = str(exc)
+            log.error('CV worker halted until restart or manual retry: %s', exc)
+            await self._alert_pause(self.paused_reason)
+        except PipelineError as exc:
             self.paused_reason = str(exc)
             log.error('CV worker paused for %ss: %s', cfg['config_pause'], exc)
             await self._alert_pause(self.paused_reason)
@@ -796,12 +946,14 @@ async def check():
 
 def print_status():
     with connect() as db:
-        rows = db.execute('SELECT j.id,j.score,j.title,j.company,c.status,c.attempts,c.last_error,c.warnings '
+        rows = db.execute('SELECT j.id,j.score,j.title,j.company,c.status,c.attempts,c.last_error,c.warnings,c.next_attempt_at '
                           'FROM jobs j LEFT JOIN cv_jobs c ON c.job_id=j.id ORDER BY j.id').fetchall()
     print(f'{"ID":>4}  {"SCORE":>5}  {"CV":<13} {"TRIES":>5}  JOB')
     for r in rows:
         status = r['status'] or cv_state(r['id'], None)['cv_status']
         print(f'{r["id"]:>4}  {r["score"]:>5}  {status:<13} {r["attempts"] or 0:>5}  {r["title"]} — {r["company"]}')
+        if r['status'] == 'waiting_retry' and r['next_attempt_at']:
+            print(f'{"":>32}next retry after {r["next_attempt_at"][:19]} UTC')
         detail = r['last_error'] or (r['warnings'] or '').replace('\n', ' | ')
         if detail:
             print(f'{"":>32}{detail[:200]}')

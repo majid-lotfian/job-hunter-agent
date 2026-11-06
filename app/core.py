@@ -22,6 +22,38 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 logging.getLogger('httpx').setLevel(logging.WARNING)
 log = logging.getLogger('jobhunter')
 
+# Secrets that can appear in exception text (httpx puts the full request URL, including the Telegram bot token,
+# into HTTPStatusError messages and tracebacks).
+SECRET_PATTERNS = (
+    (re.compile(r'(api\.telegram\.org/(?:file/)?bot)[^/\s\'"]+'), r'\1<redacted>'),
+    (re.compile(r'\bbot\d{5,}:[A-Za-z0-9_-]{20,}'), 'bot<redacted>'),
+    (re.compile(r'([?&](?:key|api_key|app_key|token)=)[^&\s\'"]+', re.I), r'\1<redacted>'),
+)
+
+
+def redact_secrets(text):
+    for pattern, replacement in SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+class RedactingFormatter(logging.Formatter):
+    """Formatter that scrubs tokens/keys from the whole record, tracebacks included."""
+
+    def format(self, record):
+        return redact_secrets(super().format(record))
+
+
+def _install_redaction():
+    for handler in logging.getLogger().handlers:
+        if not isinstance(handler.formatter, RedactingFormatter):
+            fmt = handler.formatter
+            handler.setFormatter(RedactingFormatter(fmt._fmt if fmt else '%(asctime)s %(levelname)s %(message)s',
+                                                    fmt.datefmt if fmt else None))
+
+
+_install_redaction()
+
 
 def config(filename):
     with (ROOT / filename).open(encoding='utf-8') as f:
@@ -51,7 +83,7 @@ def init_db():
             note TEXT, created_at TEXT NOT NULL
         );
         -- Automatic CV generation queue/state, one row per job (see app/cv_pipeline.py).
-        -- status: pending | generating | ready | failed | needs_review
+        -- status: pending | generating | waiting_retry | ready | failed | needs_review | cancelled
         CREATE TABLE IF NOT EXISTS cv_jobs (
             job_id INTEGER PRIMARY KEY REFERENCES jobs(id), status TEXT NOT NULL,
             reason TEXT NOT NULL DEFAULT 'new', attempts INTEGER NOT NULL DEFAULT 0,
@@ -59,6 +91,8 @@ def init_db():
             model TEXT, source TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS cv_jobs_due ON cv_jobs(status, next_attempt_at);
+        -- Small persistent key/value state for the LLM client (shared overload cooldown), survives restarts.
+        CREATE TABLE IF NOT EXISTS llm_state (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
         ''')
         # Additive cv_jobs columns: daily automatic quota and persistent digest notification state.
         cv_cols = {r['name'] for r in db.execute('PRAGMA table_info(cv_jobs)')}
@@ -67,8 +101,27 @@ def init_db():
                 db.execute(f'ALTER TABLE cv_jobs ADD COLUMN {column} TEXT')
         if 'notified_at' not in cv_cols:  # outcomes that existed before digests were already announced
             db.execute("UPDATE cv_jobs SET notified_at=updated_at WHERE status IN ('ready','needs_review','failed')")
+        # Transient-failure recovery state (app/cv_pipeline.py): retry cycle, start of the current transient episode.
+        for column, ddl in (('retry_cycle', 'INTEGER NOT NULL DEFAULT 0'), ('transient_since', 'TEXT'),
+                            ('last_error_kind', 'TEXT')):
+            if column not in cv_cols:
+                db.execute(f'ALTER TABLE cv_jobs ADD COLUMN {column} {ddl}')
+        if 'retry_cycle' not in cv_cols:
+            # One-time: jobs that older code failed permanently only because Gemini was temporarily overloaded or
+            # rate limited (5xx/429/timeout/network) get another chance. They wait in waiting_retry and are retried
+            # automatically (already announced, so no new failure message). Validation/permanent failures stay failed.
+            db.execute(f"""UPDATE cv_jobs SET status='waiting_retry', attempts=0, retry_cycle=1, next_attempt_at=?,
+                               transient_since=COALESCE(transient_since, updated_at), last_error_kind='overload',
+                               last_error='Recovered after transient failure: ' || last_error, updated_at=?
+                           WHERE status='failed' AND last_error LIKE 'Gave up after % attempts: %'
+                             AND ({' OR '.join("last_error LIKE ?" for _ in TRANSIENT_FAILURE_MARKERS)})""",
+                       (now_iso(), now_iso(), *[f'%{m}%' for m in TRANSIENT_FAILURE_MARKERS]))
     from .discovery import store  # lazy: store imports core
     store.migrate()
+
+
+TRANSIENT_FAILURE_MARKERS = ('HTTP 429', 'HTTP 500', 'HTTP 502', 'HTTP 503', 'HTTP 504', 'HTTP 408',
+                             'RESOURCE_EXHAUSTED', 'UNAVAILABLE', 'timed out', 'network error')
 
 
 def now_iso():
@@ -83,7 +136,7 @@ def get_cv_job(job_id):
 def set_cv_job(job_id, status, **fields):
     """Insert or update the cv_jobs row for a job. Unspecified columns keep their value."""
     allowed = {'reason', 'attempts', 'next_attempt_at', 'last_error', 'warnings', 'notes', 'model', 'source',
-               'quota_day', 'notified_at', 'completed_at'}
+               'quota_day', 'notified_at', 'completed_at', 'retry_cycle', 'transient_since', 'last_error_kind'}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f'Unknown cv_jobs fields: {sorted(unknown)}')

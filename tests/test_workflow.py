@@ -97,7 +97,7 @@ class Base(unittest.TestCase):
                                                'LLM_MAX_REQUESTS_PER_DAY': '250', 'TELEGRAM_ACTIONS_PER_BATCH': '8'})):
             p.start()
             self.addCleanup(p.stop)
-        cv_pipeline._cooldown['until'] = 0
+        cv_pipeline.clear_cooldown()
         workflow._last_summary['count'] = None
         with core.connect() as db:
             for t in ('applications', 'approvals', 'cv_jobs', 'events', 'job_sources', 'llm_usage', 'jobs'):
@@ -464,7 +464,7 @@ class WorkerThroughputTests(Base):
         cv_pipeline.enqueue(other, 'new')
         self.assertIsNone(cv_pipeline.claim_next())
         self.assertGreater(cv_pipeline.quota_status()['rate_limited_for_seconds'], 0)
-        cv_pipeline._cooldown['until'] = 0
+        cv_pipeline.clear_cooldown()
         self.assertEqual(cv_pipeline.claim_next(), other)
 
     def test_concurrency_processes_queue_without_double_claims(self):

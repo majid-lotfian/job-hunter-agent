@@ -8,7 +8,10 @@ Configuration comes only from the environment (.env), never from source code:
     LLM_TIMEOUT_SECONDS=120
 
 Errors are classified so the caller can decide what to do:
-    TemporaryLLMError     -> retry later with backoff (429, 5xx, timeouts, network)
+    TemporaryLLMError     -> retry later with backoff (429, 5xx, timeouts, network). `.kind` says why:
+                             overload (500/502/503/504: model busy), rate_limit (429), quota_daily (429 on a
+                             per-day quota), timeout, network, malformed, empty. `.retry_after` (seconds) comes
+                             from the Retry-After header or Gemini's RetryInfo.retryDelay when present.
     MalformedResponseError-> (a TemporaryLLMError) reply was not a complete JSON object; retry
     ConfigurationLLMError -> do not burn attempts; fix .env (missing/invalid key, unknown model)
     PermanentLLMError     -> this request will not succeed as-is (blocked, malformed reply)
@@ -16,6 +19,8 @@ Errors are classified so the caller can decide what to do:
 import json
 import os
 import re
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -30,13 +35,25 @@ class LLMError(Exception):
 
 
 class TemporaryLLMError(LLMError):
-    def __init__(self, message, retry_after=None):
+    kind = 'temporary'
+
+    def __init__(self, message, retry_after=None, kind=None, status=None):
         super().__init__(message)
         self.retry_after = retry_after
+        self.status = status
+        if kind:
+            self.kind = kind
+        elif type(self).kind == 'temporary':   # built without a kind (older callers): infer from the message
+            text = str(message)
+            if '429' in text or 'RESOURCE_EXHAUSTED' in text:
+                self.kind = 'rate_limit'
+            elif re.search(r'HTTP 50[0234]\b|UNAVAILABLE', text):
+                self.kind = 'overload'
 
 
 class MalformedResponseError(TemporaryLLMError):
     """The reply was empty, truncated or not a JSON object. Retryable: sampling again usually works."""
+    kind = 'malformed'
 
 
 class ConfigurationLLMError(LLMError):
@@ -78,9 +95,44 @@ def parse_json_object(text):
     raise MalformedResponseError('Gemini reply was not valid JSON')
 
 
+DURATION = re.compile(r'^\s*(\d+(?:\.\d+)?)s\s*$')
+
+
+def _error_body(response):
+    try:
+        err = response.json().get('error', {})
+        return err if isinstance(err, dict) else {}
+    except (ValueError, AttributeError):
+        return {}
+
+
 def _retry_after(response):
-    value = response.headers.get('retry-after', '')
-    return float(value) if value.replace('.', '', 1).isdigit() else None
+    """Seconds to wait, from the Retry-After header (seconds or HTTP date) or Gemini's RetryInfo detail."""
+    value = response.headers.get('retry-after', '').strip()
+    if value.replace('.', '', 1).isdigit():
+        return float(value)
+    if value:
+        try:
+            return max(0.0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, IndexError):
+            pass
+    for detail in _error_body(response).get('details') or []:
+        if isinstance(detail, dict) and str(detail.get('@type', '')).endswith('RetryInfo'):
+            match = DURATION.match(str(detail.get('retryDelay', '')))
+            if match:
+                return float(match.group(1))
+    return None
+
+
+def _temporary_kind(response):
+    if response.status_code != 429:
+        return 'overload' if response.status_code >= 500 else 'timeout'   # 408 = request timeout
+    for detail in _error_body(response).get('details') or []:
+        if isinstance(detail, dict) and str(detail.get('@type', '')).endswith('QuotaFailure'):
+            if any('perday' in str(v.get('quotaId', '')).lower() for v in detail.get('violations') or []
+                   if isinstance(v, dict)):
+                return 'quota_daily'
+    return 'rate_limit'
 
 
 def _error_message(response):
@@ -113,11 +165,12 @@ class GeminiProvider:
             async with self._client() as client:
                 response = await client.request(method, url, **kwargs)
         except httpx.TimeoutException as exc:
-            raise TemporaryLLMError(f'Gemini request timed out ({type(exc).__name__})') from None
+            raise TemporaryLLMError(f'Gemini request timed out ({type(exc).__name__})', kind='timeout') from None
         except httpx.TransportError as exc:
-            raise TemporaryLLMError(f'Gemini network error ({type(exc).__name__})') from None
+            raise TemporaryLLMError(f'Gemini network error ({type(exc).__name__})', kind='network') from None
         if response.status_code in TEMPORARY_STATUS:
-            raise TemporaryLLMError(_error_message(response), _retry_after(response))
+            raise TemporaryLLMError(_error_message(response), _retry_after(response),
+                                    kind=_temporary_kind(response), status=response.status_code)
         if response.status_code in CONFIG_STATUS:
             raise ConfigurationLLMError(_error_message(response))
         if response.status_code >= 400:
@@ -125,7 +178,7 @@ class GeminiProvider:
         try:
             return response.json()
         except ValueError:
-            raise TemporaryLLMError('Gemini returned a non-JSON response') from None
+            raise TemporaryLLMError('Gemini returned a non-JSON response', kind='malformed') from None
 
     async def generate_json(self, system, prompt, temperature=0.2, max_output_tokens=32768, schema=None):
         """Return the model's reply parsed as a JSON object.
@@ -158,7 +211,7 @@ class GeminiProvider:
             raise PermanentLLMError(f'Gemini blocked the prompt: {block}')
         candidates = data.get('candidates') or []
         if not candidates:
-            raise TemporaryLLMError('Gemini returned no candidates')
+            raise TemporaryLLMError('Gemini returned no candidates', kind='empty')
         candidate = candidates[0]
         finish = candidate.get('finishReason', '')
         text = ''.join(p.get('text', '') for p in (candidate.get('content') or {}).get('parts', [])

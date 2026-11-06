@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -156,6 +157,30 @@ class GeminiProviderTests(unittest.TestCase):
             self.assertEqual(exc.retry_after, 30.0)
             self.assertIn('RESOURCE_EXHAUSTED', str(exc))
 
+    def test_temporary_error_kinds_and_retry_hints(self):
+        quota_day = {'error': {'code': 429, 'status': 'RESOURCE_EXHAUSTED', 'message': 'Quota exceeded', 'details': [
+            {'@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+             'violations': [{'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'}]},
+            {'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '41s'}]}}
+        per_minute = {'error': {'code': 429, 'status': 'RESOURCE_EXHAUSTED', 'details': [
+            {'@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+             'violations': [{'quotaId': 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier'}]}]}}
+        date = 'Wed, 21 Oct 2099 07:28:00 GMT'
+        cases = [(lambda r: httpx.Response(503, json={'error': {'status': 'UNAVAILABLE'}}), 'overload', None),
+                 (lambda r: httpx.Response(500), 'overload', None),
+                 (lambda r: httpx.Response(429, json=quota_day), 'quota_daily', 41.0),
+                 (lambda r: httpx.Response(429, json=per_minute), 'rate_limit', None),
+                 (lambda r: httpx.Response(429, headers={'retry-after': '12'}), 'rate_limit', 12.0)]
+        for handler, kind, retry_after in cases:
+            with self.assertRaises(llm.TemporaryLLMError) as ctx:
+                run(self.provider(handler).generate_json('s', 'p'))
+            self.assertEqual((ctx.exception.kind, ctx.exception.retry_after), (kind, retry_after))
+        with self.assertRaises(llm.TemporaryLLMError) as ctx:
+            run(self.provider(lambda r: httpx.Response(503, headers={'retry-after': date})).generate_json('s', 'p'))
+        self.assertGreater(ctx.exception.retry_after, 0)
+        self.assertEqual(llm.TemporaryLLMError('HTTP 503 UNAVAILABLE: busy').kind, 'overload')
+        self.assertEqual(llm.MalformedResponseError('x').kind, 'malformed')
+
     def test_timeout_and_network_errors_are_temporary(self):
         for exc in (httpx.ReadTimeout('slow'), httpx.ConnectError('down')):
             def handler(request, exc=exc):
@@ -247,7 +272,7 @@ class PipelineTests(unittest.TestCase):
             self.sent.append(text)
             return True
         self.fake_send = fake_send
-        cv_pipeline._cooldown['until'] = 0
+        cv_pipeline.clear_cooldown()
         for patcher in (mock.patch.object(cv_pipeline, 'MASTER', self.master),
                         mock.patch.object(cv_pipeline, 'WORKSPACES', self.tmp / 'tailoring'),
                         mock.patch.object(cv_pipeline, 'cv_path', lambda i: self.cvs / f'job-{i}.html'),
@@ -276,7 +301,7 @@ class PipelineTests(unittest.TestCase):
         status = run(cv_pipeline.process(job_id, provider))
         run(cv_pipeline.send_cv_digest())  # the worker sends the failure digest after each batch ...
         run(workflow.send_pending_actions(sender=self.fake_send))  # ... and actionable Approve & Apply messages
-        cv_pipeline._cooldown['until'] = 0  # tests drive retries explicitly
+        cv_pipeline.clear_cooldown()  # tests drive retries explicitly
         return job_id, status
 
     # --- happy path, integrity, privacy
@@ -380,22 +405,24 @@ class PipelineTests(unittest.TestCase):
 
     # --- retries and backoff
 
-    def test_temporary_errors_back_off_then_fail_after_max_attempts(self):
+    def test_temporary_errors_back_off_then_wait_instead_of_failing(self):
         cv_pipeline.enqueue(self.job)
         provider = FakeProvider(*[llm.TemporaryLLMError('HTTP 429 RESOURCE_EXHAUSTED', retry_after=5)] * 3)
         job_id, status = self.claim_and_process(provider)
         self.assertEqual(status, 'pending')
         row = core.get_cv_job(job_id)
-        self.assertEqual(row['attempts'], 1)
+        self.assertEqual((row['attempts'], row['last_error_kind']), (1, 'rate_limit'))
         self.assertIsNotNone(row['next_attempt_at'])
         self.assertIsNone(cv_pipeline.claim_next())  # not due yet
-        for expected in ('pending', 'failed'):
+        for expected in ('pending', 'waiting_retry'):
             with core.connect() as db:
                 db.execute('UPDATE cv_jobs SET next_attempt_at=NULL WHERE job_id=?', (job_id,))
             self.assertEqual(self.claim_and_process(provider)[1], expected)
-        self.assertEqual(core.get_cv_job(job_id)['attempts'], 3)
-        self.assertIn('Gave up after 3 attempts', core.get_cv_job(job_id)['last_error'])
-        self.assertIsNone(cv_pipeline.claim_next())  # failed jobs are not retried automatically
+        row = core.get_cv_job(job_id)
+        self.assertEqual((row['status'], row['attempts'], row['retry_cycle']), ('waiting_retry', 0, 1))
+        self.assertIsNotNone(row['transient_since'])
+        self.assertIsNone(cv_pipeline.claim_next())  # cooldown not over yet
+        self.assertEqual(self.sent, [])               # no Telegram message for a job that is still being retried
 
     def test_malformed_reply_recovers_in_correction_round(self):
         cv_pipeline.enqueue(self.job)
@@ -415,7 +442,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(status, 'pending')  # retryable, not failed
         row = core.get_cv_job(job_id)
         self.assertIsNotNone(row['next_attempt_at'])
-        self.assertIn('Temporary: Gemini reply was cut off', row['last_error'])
+        self.assertIn('Temporary (malformed): Gemini reply was cut off', row['last_error'])
         self.assertFalse((self.cvs / f'job-{job_id}.html').exists())  # nothing published
         self.assertEqual(self.sent, [])
         self.assertIsNone(cv_pipeline.claim_next())  # waits for backoff
@@ -473,21 +500,37 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('Professional Experience', provider.prompts[1][1])
         self.assertIn('ML Engineer — Acme BV', (self.cvs / f'job-{job_id}.html').read_text(encoding='utf-8'))
 
-    def test_backoff_is_bounded(self):
-        cfg = {**cv_pipeline.settings(), 'retry_base': 60, 'retry_max': 3600}
-        self.assertEqual([cv_pipeline.backoff_seconds(a, cfg) for a in (1, 2, 3, 4, 10)], [60, 240, 960, 3600, 3600])
-        self.assertEqual(cv_pipeline.backoff_seconds(1, cfg, retry_after=600), 600)
-        self.assertEqual(cv_pipeline.backoff_seconds(1, cfg, retry_after=10 ** 6), 3600)
+    def test_backoff_is_bounded_with_jitter(self):
+        cfg = {**cv_pipeline.settings(), 'retry_base': 60, 'retry_max': 3600, 'wait_max': 7200}
+        with mock.patch.object(cv_pipeline, '_jitter', lambda lo, hi: hi):
+            self.assertEqual([cv_pipeline.backoff_seconds(a, cfg) for a in (1, 2, 3, 4, 7, 10)],
+                             [60, 120, 240, 480, 3600, 3600])
+            self.assertEqual(cv_pipeline.backoff_seconds(1, cfg, retry_after=600), 600)     # Retry-After honoured
+            self.assertEqual(cv_pipeline.backoff_seconds(1, cfg, retry_after=10 ** 6), 7200)  # but bounded
+        with mock.patch.object(cv_pipeline, '_jitter', lambda lo, hi: lo):
+            self.assertEqual([cv_pipeline.backoff_seconds(a, cfg) for a in (1, 2, 3)], [30, 60, 120])
+        for _ in range(50):  # real jitter stays inside its band
+            self.assertTrue(30 <= cv_pipeline.backoff_seconds(1, cfg) <= 60)
 
-    def test_configuration_error_pauses_without_burning_attempts(self):
+    def test_configuration_error_halts_without_burning_attempts_or_retrying(self):
         cv_pipeline.enqueue(self.job)
-        worker = cv_pipeline.CVWorker(lambda: FakeProvider(llm.ConfigurationLLMError('HTTP 401: API key not valid')))
-        with mock.patch.object(worker, '_sleep', mock.AsyncMock()) as sleep:
+        calls = []
+
+        def factory():
+            calls.append(1)
+            return FakeProvider(llm.ConfigurationLLMError('HTTP 401: API key not valid'))
+        worker = cv_pipeline.CVWorker(factory)
+        with mock.patch.object(worker, '_sleep', mock.AsyncMock()):
             self.assertTrue(run(worker.run_once()))
-            sleep.assert_awaited_once()
+            self.assertFalse(run(worker.run_once()))   # halted: no second API call for a bad key
+            self.assertFalse(run(worker.run_once()))
+        self.assertEqual(len(calls), 1)
         row = core.get_cv_job(self.job)
         self.assertEqual((row['status'], row['attempts']), ('pending', 0))
         self.assertIn('API key', worker.paused_reason)
+        self.assertEqual(len(self.sent), 1)          # one alert, not one per poll
+        worker.request(self.job)                      # dashboard "Retry" lifts the halt
+        self.assertIsNone(worker.halted_reason)
 
     def test_missing_api_key_claims_nothing(self):
         cv_pipeline.enqueue(self.job)
@@ -611,6 +654,220 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(state['cv_status'], 'failed')
         self.assertIn('validation', state['cv_error'])
         self.assertEqual(cv_pipeline.enqueue(self.job, 'manual'), 'pending')  # retry allowed for failed
+
+
+class TransientRecoveryTests(unittest.TestCase):
+    """Gemini overload / rate limit recovery: waiting_retry, shared persistent cooldown, restarts, give-up."""
+    add_job = PipelineTests.add_job
+    claim_and_process = PipelineTests.claim_and_process
+
+    def setUp(self):
+        PipelineTests.setUp(self)
+        cv_pipeline.clear_cooldown()
+        self.addCleanup(cv_pipeline.clear_cooldown)
+
+    def make_due(self, job_id=None):
+        with core.connect() as db:
+            db.execute('UPDATE cv_jobs SET next_attempt_at=NULL' + (' WHERE job_id=?' if job_id else ''),
+                       (job_id,) if job_id else ())
+
+    @staticmethod
+    def overloaded(request=None):
+        return httpx.Response(503, json={'error': {'code': 503, 'status': 'UNAVAILABLE', 'message':
+                              'This model is currently experiencing high demand. Spikes in demand are usually '
+                              'temporary. Please try again later.'}})
+
+    def gemini(self, *responses):
+        queue = list(responses)
+        return llm.GeminiProvider('test-key', 'gemini-test-flash',
+                                  transport=httpx.MockTransport(lambda r: queue.pop(0)(r)))
+
+    def test_real_503_is_overload_and_sets_shared_persistent_cooldown(self):
+        other = self.add_job(score=99)
+        cv_pipeline.enqueue(self.job)
+        cv_pipeline.enqueue(other)
+        job_id = cv_pipeline.claim_next()
+        self.assertEqual(job_id, other)               # highest score first
+        status = run(cv_pipeline.process(job_id, self.gemini(self.overloaded)))
+        self.assertEqual(status, 'pending')
+        row = core.get_cv_job(job_id)
+        self.assertEqual(row['last_error_kind'], 'overload')
+        self.assertIn('HTTP 503 UNAVAILABLE', row['last_error'])
+        self.assertGreater(cv_pipeline.cooldown_remaining(), 0)
+        self.assertIsNone(cv_pipeline.claim_next())   # the other job waits too: the model is busy
+        # the cooldown is stored in the database, so a restarted process honours it
+        cv_pipeline.CVWorker(lambda: FakeProvider())  # a fresh worker has no in-memory state to lose
+        self.assertIsNone(cv_pipeline.claim_next())
+        self.assertIn('overload', cv_pipeline.cooldown_reason())
+        self.assertGreater(cv_pipeline.quota_status()['rate_limited_for_seconds'], 0)
+
+    def test_shared_cooldown_doubles_with_streak_and_resets_on_success(self):
+        cfg = cv_pipeline.settings()
+        exc = llm.TemporaryLLMError('HTTP 503 UNAVAILABLE', kind='overload')
+        with mock.patch.object(cv_pipeline, '_jitter', lambda lo, hi: 1.0):
+            pauses = [cv_pipeline.note_model_busy(exc, cfg) for _ in range(7)]
+        self.assertEqual(pauses, [30, 60, 120, 240, 480, 900, 900])   # capped at LLM_OVERLOAD_COOLDOWN_MAX_SECONDS
+        cv_pipeline.note_model_ok()
+        with mock.patch.object(cv_pipeline, '_jitter', lambda lo, hi: 1.0):
+            self.assertEqual(cv_pipeline.note_model_busy(exc, cfg), 30)
+        quota = llm.TemporaryLLMError('HTTP 429 RESOURCE_EXHAUSTED', kind='quota_daily')
+        self.assertGreaterEqual(cv_pipeline.note_model_busy(quota, cfg), 3600)
+        rate = llm.TemporaryLLMError('HTTP 429', kind='rate_limit', retry_after=1800)
+        self.assertGreaterEqual(cv_pipeline.note_model_busy(rate, cfg), 1800)
+
+    def test_retry_after_is_respected(self):
+        cv_pipeline.enqueue(self.job)
+        before = datetime.now(timezone.utc)
+        self.claim_and_process(FakeProvider(llm.TemporaryLLMError('HTTP 429 RESOURCE_EXHAUSTED', retry_after=1200)))
+        retry_at = datetime.fromisoformat(core.get_cv_job(self.job)['next_attempt_at'])
+        self.assertGreaterEqual((retry_at - before).total_seconds(), 1199)
+
+    def test_overload_five_times_waits_then_completes_without_duplicates(self):
+        cv_pipeline.enqueue(self.job)
+        with mock.patch.dict(os.environ, {'CV_MAX_ATTEMPTS': '5'}):
+            statuses = []
+            for _ in range(5):
+                self.make_due()
+                statuses.append(self.claim_and_process(self.gemini(self.overloaded))[1])
+            self.assertEqual(statuses, ['pending'] * 4 + ['waiting_retry'])
+            row = core.get_cv_job(self.job)
+            wait = (datetime.fromisoformat(row['next_attempt_at']) - datetime.now(timezone.utc)).total_seconds()
+            self.assertTrue(5 * 60 <= wait <= 15 * 60, wait)          # first cooldown: ~10 min (8-12 with jitter)
+            self.assertIsNone(cv_pipeline.claim_next())
+            self.assertEqual(run(cv_pipeline.send_cv_digest()), 0)   # nothing to announce
+            self.assertEqual(self.sent, [])
+            self.make_due()
+            job_id, status = self.claim_and_process(FakeProvider(good_reply))
+        self.assertEqual((job_id, status), (self.job, 'ready'))
+        row = core.get_cv_job(self.job)
+        self.assertEqual((row['attempts'], row['retry_cycle'], row['transient_since'], row['last_error']), (1, 0, None, None))
+        self.assertTrue(cv_pipeline.has_marker(self.cvs / f'job-{self.job}.html'))
+        self.assertIsNone(cv_pipeline.claim_next())                 # never generated twice
+        self.assertEqual(cv_pipeline.enqueue(self.job, 'new'), 'ready')
+
+    def test_cooldown_grows_per_cycle(self):
+        cfg = {**cv_pipeline.settings(), 'wait_base': 600, 'wait_max': 21600}
+        with mock.patch.object(cv_pipeline, '_jitter', lambda lo, hi: 1.0):
+            self.assertEqual([cv_pipeline.wait_retry_seconds(c, cfg) for c in (1, 2, 3, 6, 10)],
+                             [600, 1200, 2400, 19200, 21600])
+            self.assertEqual(cv_pipeline.wait_retry_seconds(1, cfg, retry_after=3000), 3000)
+
+    def test_waiting_retry_survives_restart(self):
+        cv_pipeline.enqueue(self.job)
+        core.set_cv_job(self.job, 'waiting_retry', attempts=0, retry_cycle=2, transient_since=core.now_iso(),
+                        next_attempt_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat())
+        core.init_db()                 # what a service restart does
+        cv_pipeline.recover_stale()
+        row = core.get_cv_job(self.job)
+        self.assertEqual((row['status'], row['retry_cycle']), ('waiting_retry', 2))
+        self.assertIsNone(cv_pipeline.claim_next())
+        self.make_due()
+        self.assertEqual(cv_pipeline.claim_next(), self.job)
+        self.assertEqual(core.get_cv_job(self.job)['attempts'], 1)  # fresh cycle
+        # a crash while generating puts it back in the queue with its retry history intact
+        cv_pipeline.recover_stale()
+        row = core.get_cv_job(self.job)
+        self.assertEqual((row['status'], row['retry_cycle']), ('pending', 2))
+
+    def test_gives_up_after_configured_hours_and_announces_once(self):
+        cv_pipeline.enqueue(self.job)
+        old = (datetime.now(timezone.utc) - timedelta(hours=80)).isoformat()
+        core.set_cv_job(self.job, 'waiting_retry', retry_cycle=6, transient_since=old)
+        _, status = self.claim_and_process(FakeProvider(llm.TemporaryLLMError('HTTP 503 UNAVAILABLE')))
+        self.assertEqual(status, 'failed')
+        self.assertIn('Gave up after 72h', core.get_cv_job(self.job)['last_error'])
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(run(cv_pipeline.send_cv_digest()), 0)
+        self.assertIsNone(cv_pipeline.claim_next())
+
+    def test_permanent_errors_fail_immediately(self):
+        cv_pipeline.enqueue(self.job)
+        bad_request = lambda r: httpx.Response(400, json={'error': {'status': 'INVALID_ARGUMENT', 'message': 'bad'}})
+        _, status = self.claim_and_process(self.gemini(bad_request, bad_request))
+        self.assertEqual(status, 'failed')
+        self.assertEqual(core.get_cv_job(self.job)['attempts'], 1)
+        self.assertIsNone(cv_pipeline.claim_next())
+
+    def test_auto_requeue_keeps_cooldown_but_manual_retry_skips_it(self):
+        cv_pipeline.enqueue(self.job)
+        later = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        core.set_cv_job(self.job, 'waiting_retry', next_attempt_at=later, retry_cycle=1)
+        self.assertEqual(cv_pipeline.enqueue(self.job, 'new'), 'waiting_retry')
+        self.assertEqual(core.get_cv_job(self.job)['next_attempt_at'], later)
+        self.assertEqual(cv_pipeline.enqueue(self.job, 'manual'), 'pending')
+        self.assertEqual(cv_pipeline.claim_next(), self.job)
+
+    def test_cv_that_appeared_while_waiting_is_kept(self):
+        self.cvs.mkdir(parents=True)
+        cv_pipeline.enqueue(self.job)
+        core.set_cv_job(self.job, 'waiting_retry', retry_cycle=1)
+        (self.cvs / f'job-{self.job}.html').write_text(
+            MASTER.replace('</head>', f'<meta name="{cv_pipeline.MARKER}" content="job-{self.job}"></head>'), encoding='utf-8')
+        provider = FakeProvider()
+        _, status = self.claim_and_process(provider)
+        self.assertEqual(status, 'ready')
+        self.assertEqual(provider.prompts, [])
+
+    def test_waiting_state_visible_in_dashboard_and_workflow(self):
+        cv_pipeline.enqueue(self.job)
+        later = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+        core.set_cv_job(self.job, 'waiting_retry', next_attempt_at=later, last_error='Temporary (overload): HTTP 503')
+        state = cv_pipeline.cv_state(self.job)
+        self.assertEqual((state['cv_status'], state['next_retry_at']), ('waiting_retry', later))
+        self.assertIn('retrying automatically', state['cv_error'])
+        self.assertEqual(workflow.job_state(self.job)['actions'], [workflow.REJECT])
+        self.assertEqual(cv_pipeline.quota_status()['waiting_retry'], 1)
+
+
+class TransientMigrationTests(unittest.TestCase):
+    def test_old_transient_failures_become_waiting_retry_once(self):
+        import sqlite3
+        path = Path(_TMP.name) / 'cv-transient.sqlite3'
+        db = sqlite3.connect(path)
+        db.executescript("""CREATE TABLE cv_jobs (job_id INTEGER PRIMARY KEY, status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT 'new',
+            attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, last_error TEXT, warnings TEXT, notes TEXT, model TEXT,
+            source TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            INSERT INTO cv_jobs (job_id,status,attempts,last_error,created_at,updated_at) VALUES
+              (7,'failed',5,'Gave up after 5 attempts: HTTP 503 UNAVAILABLE: This model is currently experiencing high demand.','t','t'),
+              (8,'failed',1,'Generated CV failed validation: missing section','t','t'),
+              (9,'failed',5,'Gave up after 5 attempts: Gemini reply was not valid JSON','t','t'),
+              (10,'ready',1,NULL,'t','t');""")
+        db.commit(), db.close()
+        from app.discovery import store
+        with mock.patch.object(core, 'DB', path), mock.patch.object(store, 'DB', path):
+            core.init_db()
+            core.init_db()   # idempotent
+            db = sqlite3.connect(path)
+            db.row_factory = sqlite3.Row
+            rows = {r['job_id']: r for r in db.execute('SELECT * FROM cv_jobs')}
+            db.close()
+        self.assertEqual((rows[7]['status'], rows[7]['attempts'], rows[7]['retry_cycle']), ('waiting_retry', 0, 1))
+        self.assertIsNotNone(rows[7]['next_attempt_at'])
+        self.assertEqual(rows[7]['notified_at'], 't')        # already announced: no repeat message
+        self.assertEqual([rows[i]['status'] for i in (8, 9, 10)], ['failed', 'failed', 'ready'])
+
+
+class LogRedactionTests(unittest.TestCase):
+    def test_telegram_token_and_keys_are_scrubbed_from_logs(self):
+        import io
+        import logging
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(core.RedactingFormatter('%(message)s'))
+        logger = logging.getLogger('redaction-test')
+        logger.addHandler(handler)
+        logger.propagate = False
+        token = '1234567890:AAFakeTokenFakeTokenFakeToken_123'
+        try:
+            raise RuntimeError(f"Server error '502 Bad Gateway' for url 'https://api.telegram.org/bot{token}/getUpdates?timeout=25'")
+        except RuntimeError:
+            logger.exception('Telegram polling error; retrying')
+        logger.warning('fetch https://api.example/v1?app_id=1&app_key=SECRETVALUE&key=OTHERSECRET')
+        out = stream.getvalue()
+        for secret in (token, 'AAFakeToken', 'SECRETVALUE', 'OTHERSECRET'):
+            self.assertNotIn(secret, out)
+        self.assertIn('api.telegram.org/bot<redacted>/getUpdates', out)
+        self.assertTrue(all(isinstance(h.formatter, core.RedactingFormatter) for h in logging.getLogger().handlers))
 
 
 class DailyLimitAndDigestTests(unittest.TestCase):

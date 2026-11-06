@@ -100,7 +100,7 @@ def available_actions(job, cv_row, live_app, last_app=None):
     cv_status = cv_row['status'] if cv_row else None
     if cv_status in ('ready', 'needs_review') and cv_version(job['id']):
         return [APPROVE_APPLY, REJECT]
-    if cv_status in ('pending', 'generating'):
+    if cv_status in ('pending', 'generating', 'waiting_retry'):
         return [REJECT]
     return [APPROVE_CV_APPLY, REJECT]
 
@@ -159,7 +159,7 @@ def decide(job_id, action, *, channel, token, actor=None):
             db.execute("UPDATE approvals SET status='revoked' WHERE job_id=? AND status='active'", (job_id,))
             db.execute(f"UPDATE applications SET status='cancelled', updated_at=? WHERE job_id=? AND status IN ('awaiting_cv','queued')",
                        (now, job_id))
-            if cv_row and cv_row['status'] == 'pending':
+            if cv_row and cv_row['status'] in ('pending', 'waiting_retry'):
                 db.execute("UPDATE cv_jobs SET status='cancelled', updated_at=? WHERE job_id=?", (now, job_id))
             db.execute('INSERT INTO approvals (job_id, action, channel, job_version, cv_version, status, actor, created_at) '
                        'VALUES (?,?,?,?,?,?,?,?)', (job_id, REJECT, channel, jv, cv_ver, 'consumed', actor, now))
@@ -181,8 +181,8 @@ def decide(job_id, action, *, channel, token, actor=None):
         _event(db, job_id, 'approved', f'{channel}: Approve CV & Apply')
     # outside the transaction: queue the CV with top priority (not counted in any automatic quota)
     row = get_cv_job(job_id)
-    if row and row['status'] in ('pending', 'generating'):
-        set_cv_job(job_id, row['status'], reason='approved')
+    if row and row['status'] in ('pending', 'generating', 'waiting_retry'):
+        set_cv_job(job_id, row['status'], reason='approved')  # keeps any retry cooldown; served first when due
     else:
         cv_pipeline.enqueue(job_id, 'approved', force=bool(row and row['status'] in ('ready', 'needs_review')))
         set_cv_job(job_id, 'pending', reason='approved')
