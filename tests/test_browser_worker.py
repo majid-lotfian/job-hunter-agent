@@ -234,6 +234,33 @@ class MockFormBrowserTests(unittest.TestCase):
         r = self.run_worker('greenhouse_react.html', self.GH_REACT)
         self.assertEqual((r['status'], r['missing']), ('submitted', []), r)
 
+    def test_resume_autofill_overwrite_is_undone_before_submit(self):
+        r = self.run_worker('greenhouse_react.html?autofill=fast', self.GH_REACT)
+        self.assertEqual(r['status'], 'submitted', r)
+        self.assertIn('Received first=Test last=Candidate preferred= submits=1', r['evidence']['confirmation_text'])
+        self.assertIn('Preferred First Name', r['cleared'])          # autofilled extra field emptied again
+
+    def test_file_chosen_before_the_page_is_ready_is_attached_again(self):
+        r = self.run_worker('greenhouse_react.html?hydrate=3500&autofill=fast', self.GH_REACT)
+        self.assertEqual(r['status'], 'submitted', r)
+        self.assertIn('Received first=Test last=Candidate', r['evidence']['confirmation_text'])
+
+    def test_late_autofill_is_caught_by_the_final_check(self):
+        r = self.run_worker('greenhouse_react.html?autofill=late', self.GH_REACT)
+        self.assertEqual(r['status'], 'submitted', r)
+        self.assertIn('First Name', r['refilled'])
+        self.assertIn('Received first=Test last=Candidate preferred= submits=1', r['evidence']['confirmation_text'])
+
+    def test_field_the_page_keeps_changing_stops_before_submit(self):
+        r = self.run_worker('greenhouse_react.html?autofill=always', self.GH_REACT)
+        self.assertEqual((r['status'], r['submitted_clicked']), ('failed', False), r)
+        self.assertIn('First Name', r['missing'])
+
+    def test_greenhouse_required_message_is_reported_as_form_error(self):
+        r = self.run_worker('greenhouse_react.html?mode=gh_required', self.GH_REACT)
+        self.assertEqual((r['status'], r['submitted_clicked']), ('failed', True), r)
+        self.assertIn('First Name is required', r['reason'])
+
     def test_rejected_upload_stops_before_submit(self):
         r = self.run_worker('greenhouse_react.html?upload=reject', self.GH_REACT)
         self.assertEqual((r['status'], r['submitted_clicked']), ('failed', False), r)

@@ -7,12 +7,15 @@
 <form id="f" novalidate>
   <label for="first_name">First Name<span>*</span></label><input id="first_name" type="text" required aria-required="true">
   <label for="last_name">Last Name<span>*</span></label><input id="last_name" type="text" required aria-required="true">
+  <label for="preferred_name">Preferred First Name</label><input id="preferred_name" type="text">
   <label for="email">Email<span>*</span></label><input id="email" type="text" required aria-required="true">
   <div role="group" aria-labelledby="upload-label-resume" aria-required="true" class="file-upload" data-allow-s3="false">
     <div id="upload-label-resume" class="label upload-label">Resume/CV<span class="required">*</span></div>
     <div class="file-upload__wrapper"><button type="button">Attach</button><label class="visually-hidden" for="resume">Attach</label>
       <input id="resume" class="visually-hidden" type="file" accept=".pdf,.doc,.docx,.txt,.rtf">
       <span class="file-upload__filename"></span></div></div>
+  <div role="group" aria-labelledby="upload-label-cover" class="file-upload"><div id="upload-label-cover" class="label upload-label">Cover Letter</div>
+    <label class="visually-hidden" for="cover_letter">Attach</label><input id="cover_letter" class="visually-hidden" type="file"></div>
   <div class="select"><label for="question_1">How did you hear about this role?<span>*</span></label>
     <div class="select__control"><div class="select__value"></div>
       <input id="question_1" type="text" role="combobox" aria-expanded="false" aria-required="true" autocomplete="off"></div></div>
@@ -40,11 +43,21 @@ function openMenu() {
 document.addEventListener('keydown', e => { if (e.key === 'Escape') { const m = document.querySelector('.select__menu'); if (m) m.remove(); } });
 // like the real widget: keep the file in component state, show its name, clear the native input
 let resumeName = '';
+const ready = Date.now() + (params.get('hydrate') ? parseInt(params.get('hydrate')) : 0);   // scripts still loading
 document.getElementById('resume').addEventListener('change', ev => {
+  if (Date.now() < ready) return;                    // like the live page: a file chosen before hydration is ignored
   const f = ev.target.files[0]; if (!f) return;
   if (params.get('upload') === 'reject') {   // the widget refuses the file: input cleared, no file name shown
     ev.target.value = ''; document.querySelector('.file-upload__filename').textContent = 'Upload failed, please try again'; return; }
   resumeName = f.name; document.querySelector('.file-upload__filename').textContent = f.name; ev.target.value = '';
+  ev.target.parentElement.querySelectorAll('button, label').forEach(e => e.remove()); ev.target.remove();
+  // Greenhouse "Autofill my application": the parsed resume overwrites fields a moment after the upload
+  const af = params.get('autofill');
+  const parsed = () => { document.getElementById('first_name').value = ''; document.getElementById('last_name').value = 'Parsed';
+                         document.getElementById('preferred_name').value = 'Parsed'; };
+  if (af === 'fast') setTimeout(parsed, 500);
+  if (af === 'late') setTimeout(parsed, 7500);       // after the worker has already filled the names
+  if (af === 'always') setInterval(parsed, 300);     // a page that never lets the value stay
 });
 const ts = params.get('turnstile');           // block = widget waits for a click; pass = widget already passed silently
 if (ts) {
@@ -56,9 +69,15 @@ if (ts) {
 }
 document.getElementById('f').addEventListener('submit', ev => {
   ev.preventDefault();
+  window.__submits = (window.__submits || 0) + 1;
+  if (params.get('mode') === 'gh_required') {          // Greenhouse's client-side validation message
+    const e = document.createElement('span'); e.className = 'helper-text helper-text--error'; e.textContent = 'First Name is required.';
+    document.getElementById('first_name').after(e); return; }
   const ok = ['first_name', 'last_name', 'email'].every(id => document.getElementById(id).value) && chosen
     && resumeName && document.querySelector('input[name=loc]:checked');
   if (!ok) { const e = document.createElement('div'); e.setAttribute('role', 'alert'); e.textContent = 'Please complete all required fields'; document.body.append(e); return; }
-  document.body.innerHTML = '<h1>Thank you for applying!</h1><p>Your application has been submitted.</p>';
+  const v = id => document.getElementById(id).value;
+  document.body.innerHTML = '<h1>Thank you for applying!</h1><p>Your application has been submitted.</p><p>Received first=' + v('first_name')
+    + ' last=' + v('last_name') + ' preferred=' + v('preferred_name') + ' submits=' + window.__submits + '</p>';
 });
 </script></body></html>
