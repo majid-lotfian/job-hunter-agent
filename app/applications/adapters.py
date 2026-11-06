@@ -106,7 +106,7 @@ class RecruiteeAdapter(Adapter):
         if offer.get('options_cv') == 'required':
             fields.append('cv (file)')
             if not (cv and cv.get('pdf')):
-                missing.append('CV as PDF (only the HTML CV exists; no PDF renderer is configured)')
+                missing.append('CV as PDF (missing, invalid or outdated)')
         for option, label in (('options_cover_letter', 'cover letter'), ('options_photo', 'photo')):
             if offer.get(option) == 'required':
                 fields.append(label)

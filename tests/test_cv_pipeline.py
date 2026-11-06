@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -68,6 +69,21 @@ def good_reply(prompt, **extra):
 
 def run(coro):
     return asyncio.run(coro)
+
+
+FAKE_PDF = b'%PDF-1.7\n' + b'1 0 obj << /Type /Catalog >> endobj\n' * 40 + b'trailer\n%%EOF\n'
+REPORT = {'pages': 1, 'text_chars': 900, 'page_mm': [210.0, 297.0]}
+
+
+def fake_runner(report=None, data=FAKE_PDF, returncode=0, stderr='', calls=None):
+    """Stands in for the renderer child process: writes `data` to the output path, prints the JSON report."""
+    def runner(html_path, out_path, cfg):
+        if calls is not None:
+            calls.append(Path(html_path).name)
+        if data is not None:
+            Path(out_path).write_bytes(data)
+        return subprocess.CompletedProcess([], returncode, stdout=json.dumps(report or REPORT) + '\n', stderr=stderr)
+    return runner
 
 
 class RedactorTests(unittest.TestCase):
@@ -279,6 +295,7 @@ class PipelineTests(unittest.TestCase):
                         mock.patch.object(main, 'cv_path', lambda i: self.cvs / f'job-{i}.html'),
                         mock.patch.object(workflow, 'cv_path', lambda i: self.cvs / f'job-{i}.html'),
                         mock.patch.object(cv_pipeline, 'send_telegram', fake_send),
+                        mock.patch.object(cv_pipeline.pdf, '_run_child', fake_runner()),   # no real renders here
                         mock.patch.dict(os.environ, {'CV_MIN_SCORE': '70', 'CV_AUTO_GENERATE': 'true',
                                                      'CV_MAX_ATTEMPTS': '3', 'LLM_MIN_INTERVAL_SECONDS': '0'})):
             patcher.start()

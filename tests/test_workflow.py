@@ -19,10 +19,10 @@ os.environ['TELEGRAM_BOT_TOKEN'] = ''
 import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import applications, auth, core, cv_pipeline, main, workflow  # noqa: E402
+from app import applications, auth, core, cv_pipeline, main, pdf, workflow  # noqa: E402
 from app.applications import adapters, profile as profile_mod  # noqa: E402
 from app.discovery.http import HttpClient  # noqa: E402
-from tests.test_cv_pipeline import MASTER, FakeProvider, good_reply  # noqa: E402
+from tests.test_cv_pipeline import MASTER, FakeProvider, fake_runner, good_reply  # noqa: E402
 
 PROFILE_YAML = """verified: true
 first_name: Test
@@ -92,6 +92,7 @@ class Base(unittest.TestCase):
                   mock.patch.object(cv_pipeline, 'send_telegram', send), mock.patch.object(workflow, 'send_telegram', send),
                   mock.patch.object(applications, 'send_telegram', send),
                   mock.patch.object(profile_mod, 'PROFILE_PATH', self.profile_path),
+                  mock.patch.object(pdf, '_run_child', fake_runner()),
                   mock.patch.dict(os.environ, {'CV_MIN_SCORE': '70', 'APPROVAL_MIN_SCORE': '40', 'CV_DAILY_LIMIT': '-1',
                                                'LLM_MIN_INTERVAL_SECONDS': '0', 'APPLY_MODE': 'off', 'APPLY_LIVE_ADAPTERS': '',
                                                'LLM_MAX_REQUESTS_PER_DAY': '250', 'TELEGRAM_ACTIONS_PER_BATCH': '8'})):
@@ -115,7 +116,9 @@ class Base(unittest.TestCase):
         cv_pipeline.enqueue(job_id, 'new')
         claimed = cv_pipeline.claim_next()
         self.assertEqual(claimed, job_id)
-        return run(cv_pipeline.process(job_id, FakeProvider(good_reply)))
+        status = run(cv_pipeline.process(job_id, FakeProvider(good_reply)))   # also renders the PDF (fake renderer)
+        self.assertTrue(cv_pipeline.pdf_current(job_id))
+        return status
 
     def state(self, job_id):
         return workflow.job_state(job_id)
@@ -417,7 +420,7 @@ class RecruiteeAdapterTests(Base):
         html = self.tmp / 'cv.html'
         html.write_text('x')
         plan = run(adapters.RecruiteeAdapter().prepare(self.http(), self.job(), prof, {'html': html, 'pdf': None}))
-        self.assertEqual(plan.missing, ['CV as PDF (only the HTML CV exists; no PDF renderer is configured)'])
+        self.assertEqual(plan.missing, ['CV as PDF (missing, invalid or outdated)'])
         plan = run(adapters.RecruiteeAdapter().prepare(self.http(), self.job(), prof, {'html': html, 'pdf': html}))
         self.assertEqual(plan.status, adapters.READY)
         self.assertIn('question 1', plan.fields)
@@ -430,6 +433,77 @@ class RecruiteeAdapterTests(Base):
         self.assertIn('profile not marked verified: true', plan.missing)
         self.assertTrue(any('work permit' in m for m in plan.missing))
         self.assertFalse(adapters.RecruiteeAdapter.live_capable)
+
+
+class PdfAttachmentTests(Base):
+    """The application uses the PDF of the current HTML CV; without a valid one nothing is submitted."""
+    def approved(self):
+        job = self.add_job(score=85)
+        self.make_cv(job)
+        workflow.decide(job, workflow.APPROVE_APPLY, channel='dashboard', token=self.state(job)['token'])
+        return job
+
+    def live(self, adapter):
+        return mock.patch.object(adapters, 'ADAPTERS', [adapter]), \
+            mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': 'mocklive'})
+
+    def test_attachment_is_the_current_pdf_and_html_stays_available(self):
+        job = self.approved()
+        bundle = applications._cv_bundle(job)
+        self.assertEqual(bundle['pdf'], self.cvs / f'job-{job}.pdf')
+        self.assertEqual(bundle['html'], self.cvs / f'job-{job}.html')
+        seen = {}
+
+        class Capturing(LiveMockAdapter):
+            async def submit(self, http, job, profile, cv, plan):
+                seen.update(cv)
+                return await super().submit(http, job, profile, cv, plan)
+        a, b = self.live(Capturing())
+        with a, b:
+            self.assertEqual(self.process_applications(), ['submitted'])
+        self.assertEqual(seen['pdf'].suffix, '.pdf')
+
+    def test_missing_or_invalid_pdf_blocks_submission(self):
+        for breakage in ('missing', 'invalid', 'stale'):
+            job = self.approved()
+            pdf_file, html = self.cvs / f'job-{job}.pdf', self.cvs / f'job-{job}.html'
+            if breakage == 'missing':
+                pdf_file.unlink()
+            elif breakage == 'invalid':
+                pdf_file.write_bytes(b'not a pdf')
+            else:   # PDF rendered from an older HTML version
+                pdf.sidecar(pdf_file).write_text('0' * 64)
+            self.assertIsNone(applications._cv_bundle(job)['pdf'])
+            adapter = LiveMockAdapter()
+            a, b = self.live(adapter)
+            with a, b:
+                self.assertEqual(self.process_applications(), ['manual_action_required'], breakage)
+            self.assertEqual(adapter.submits, 0)
+            app = self.apps(job)[0]
+            self.assertIn('CV PDF is missing, invalid or outdated', app['last_error'])
+            self.assertEqual(json.loads(app['detail'])['missing'], ['CV as PDF'])
+            self.assertEqual(core.get_cv_job(job)['pdf_status'], 'pending')      # a new PDF was requested
+            self.assertNotEqual(self.job(job)['status'], 'applied')
+
+    def test_dashboard_pdf_download_uses_existing_auth(self):
+        job = self.add_job(score=85)
+        self.make_cv(job)
+        c = TestClient(main.app, base_url='https://testserver')
+        r = c.get(f'/api/jobs/{job}/cv.pdf', follow_redirects=False)
+        self.assertIn(r.status_code, (302, 303, 307))                          # not logged in: login page
+        self.assertEqual(c.post(f'/api/jobs/{job}/cv/pdf').status_code, 401)
+        c.cookies.set(auth.COOKIE_NAME, auth.new_session())
+        r = c.get(f'/api/jobs/{job}/cv.pdf')
+        self.assertEqual((r.status_code, r.headers['content-type']), (200, 'application/pdf'))
+        self.assertIn('attachment', r.headers['content-disposition'])
+        self.assertTrue(r.content.startswith(b'%PDF-'))
+        listed = next(j for j in c.get('/api/jobs').json() if j['id'] == job)
+        self.assertTrue(listed['cv_has_pdf'])
+        (self.cvs / f'job-{job}.pdf').unlink()
+        self.assertEqual(c.get(f'/api/jobs/{job}/cv.pdf').status_code, 404)
+        self.assertEqual(c.post(f'/api/jobs/{job}/cv/pdf').json(), {'pdf_status': 'pending'})
+        other = self.add_job(score=50)
+        self.assertEqual(c.post(f'/api/jobs/{other}/cv/pdf').status_code, 409)  # no HTML CV yet
 
 
 class WorkerThroughputTests(Base):

@@ -6,3 +6,4 @@ python-dotenv>=1,<2
 apscheduler>=3.10,<4
 jinja2>=3.1,<4
 beautifulsoup4>=4.12,<5
+weasyprint>=70,<71  # CV PDFs (app/pdf.py); needs the system Pango library (libpango-1.0-0)
