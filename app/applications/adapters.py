@@ -39,6 +39,7 @@ class Result:
     external_id: str = None
     missing: list = field(default_factory=list)
     fields: list = field(default_factory=list)   # names of fields that would be sent (never values)
+    evidence: dict = None                         # browser worker: evidence folder, screenshot hash, submit clicked
 
 
 @dataclass

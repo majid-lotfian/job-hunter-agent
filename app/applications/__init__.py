@@ -189,13 +189,32 @@ async def process(app_id, http, cfg=None):
         except ValueError as exc:
             log.warning('Could not mark job %s applied: %s', job['id'], exc)
         return status
+    if result.evidence:
+        detail['browser_result'] = result.evidence
     if result.status == adapters.RETRY:
         return _retry_or_fail(app_id, app, job, result.message, cfg)
+    if via_browser and result.status == adapters.BLOCKED and browser.is_human_verification(result.message):
+        return _blocked_to_manual(app_id, job, package, detail, result, finish)
     if result.status in (adapters.SUBMITTED, adapters.CONFIRMED):  # no confirmation id: outcome uncertain
         return finish('manual_action_required', 'Submission returned no confirmation id - verify in your email/portal.', detail=detail)
     if result.missing:
         detail['missing'] = result.missing
     return finish(result.status if result.status in NOTIFY_STATES else 'manual_action_required', result.message, detail=detail)
+
+
+def _blocked_to_manual(app_id, job, package, detail, result, finish):
+    """A CAPTCHA/human-verification challenge stopped the browser worker: keep the blocked outcome and its evidence in
+    the audit history, then hand the application to the manual (phone) workflow. Never retried, never solved."""
+    ev = result.evidence or {}
+    blocked = {'status': 'blocked', 'reason': result.message, 'at': now_iso(), 'evidence_dir': ev.get('dir'),
+               'screenshot_sha256': ev.get('screenshot_sha256'), 'submit_clicked': ev.get('submitted_clicked')}
+    with connect() as db:
+        _event(db, job['id'], 'application_blocked',
+               f"{result.message} (evidence: {ev.get('dir') or 'none'}; submit clicked: {bool(ev.get('submitted_clicked'))})")
+    detail.update(prepared=True, blocked=blocked, missing=(package.get('missing') or []) + (package.get('questions') or []))
+    when = 'after the Submit click - the form was not completed' if ev.get('submitted_clicked') else 'before submitting'
+    return finish('manual_action_required', f'A CAPTCHA / human-verification challenge appeared {when}. The agent never solves '
+                  'it - nothing was submitted. Apply manually with the CV PDF and link sent to Telegram.', detail=detail)
 
 
 async def _package(job, adapter, http, profile, cv, cv_version):

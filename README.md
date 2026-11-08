@@ -250,7 +250,7 @@ With discovery enabled, the agent sends matches and tailored CV notifications. R
 
 ### 8. Apply manually from your phone (Telegram)
 
-Whenever the agent cannot submit a job itself (CAPTCHA, unsupported form, missing answers, `APPLY_MODE=off`, or an unclear browser outcome), the prepared application is sent to Telegram **once**:
+Whenever the agent cannot submit a job itself (CAPTCHA, unsupported form, missing answers, `APPLY_MODE=off`, or an unclear browser outcome), the prepared application is sent to Telegram **once**. This includes a live attempt that a CAPTCHA / human-verification challenge stopped: the agent never solves it, keeps the blocked outcome and its evidence (screenshot hash, evidence folder, whether Submit had been clicked) in the audit history, and hands the application to this workflow automatically. Older CAPTCHA-blocked applications can be handed over with `python -m app.applications.manual --route-blocked <application id>`. The message contains:
 
 - the current, validated tailored CV as a real **PDF document** (download or share it straight into the employer's upload field);
 - company, job title, match score, the direct application URL, why it is not automatic, and any missing screening questions;

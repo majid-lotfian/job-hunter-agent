@@ -74,12 +74,15 @@ class BrowserIntegrationTests(SupervisedBase):
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(self.state(job)['actions'], [])
 
-    def test_challenge_or_login_is_blocked_and_never_retried(self):
-        for result in ({'status': 'blocked', 'reason': 'human verification challenge after submit - not completed',
-                        'submitted_clicked': True}, {'status': 'blocked', 'reason': 'login required', 'submitted_clicked': False}):
+    def test_challenge_goes_to_manual_login_stays_blocked_never_retried(self):
+        cases = (({'status': 'blocked', 'reason': 'human verification challenge after submit - not completed',
+                   'submitted_clicked': True}, 'manual_action_required', 'CAPTCHA'),
+                 ({'status': 'blocked', 'reason': 'login required', 'submitted_clicked': False}, 'blocked', 'cloud browser stopped'))
+        for result, status, text in cases:
             job, backend = self.gh_job(), FakeBackend(result)
-            self.assertEqual(self.run_with(backend), ['blocked'])
-            self.assertIn('cloud browser stopped', self.apps(job)[0]['last_error'])
+            self.assertEqual(self.run_with(backend), [status])
+            self.assertIn(text, self.apps(job)[0]['last_error'])
+            self.assertEqual(len(backend.calls), 1)
             self.assertNotEqual(self.job(job)['status'], 'applied')
             self.assertIsNone(applications.claim_next())
 
