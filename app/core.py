@@ -318,6 +318,20 @@ async def send_telegram(text, reply_markup=None):
     return True
 
 
+async def send_telegram_document(path, caption='', filename=None):
+    """Send a file (e.g. the tailored CV PDF) to the configured chat. Returns False when Telegram is not configured."""
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    chat = os.getenv('TELEGRAM_CHAT_ID')
+    if not token or not chat:
+        return False
+    data = Path(path).read_bytes()
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(f'https://api.telegram.org/bot{token}/sendDocument', data={'chat_id': chat, 'caption': caption[:1000]},
+                                 files={'document': (filename or Path(path).name, data, 'application/pdf')})
+        resp.raise_for_status()
+    return True
+
+
 async def notify(job_id, job):
     # Do not embed dashboard secrets in Telegram URLs. Open dashboard and authenticate separately.
     msg = f"New match ({job['score']}/100)\n{job['title']} — {job['company']}\n{job['location']}\n{job['url']}\nDashboard: {dashboard_base()}"

@@ -100,7 +100,9 @@ def build_worker_package(app, job, package, cv_pdf_location, submit):
     return {'version': 1, 'application_id': app['id'], 'job_id': job['id'], 'apply_url': form_url(job, package),
             'ats': (job['source'] or '').split(':')[0], 'cv_pdf': str(cv_pdf_location),
             'cv_filename': _cv_filename(package),
-            'fields': fields, 'submit': bool(submit), 'confirmation': {'text': [], 'url': []},
+            'fields': fields, 'submit': bool(submit),
+            # Greenhouse's hosted form moves to .../confirmation after a successful application
+            'confirmation': {'text': [], 'url': [r'greenhouse\.io/.+/confirmation'] if (job['source'] or '').startswith('greenhouse:') else []},
             'timeouts': {'page': 45, 'action': 15, 'confirm': 30}}
 
 

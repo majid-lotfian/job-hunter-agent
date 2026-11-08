@@ -19,7 +19,7 @@ from app.applications import adapters, browser  # noqa: E402
 
 FORMS = Path(__file__).parent / 'fixtures' / 'forms'
 WORKER = Path(__file__).resolve().parent.parent / 'worker' / 'apply_worker.py'
-LIVE = {'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': 'browser', 'BROWSER_WORKER': 'fake'}
+LIVE = {'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*', 'APPLY_LIVE_ADAPTERS': 'browser', 'BROWSER_WORKER': 'fake'}
 ANSWERED = FULL_PROFILE + '  - question: "Have you worked for Acme before?"\n    answer: "No"\n'
 CONFIRMED = {'status': 'submitted', 'reason': 'confirmation shown', 'submitted_clicked': True, 'filled': [], 'missing': [],
              'evidence': {'url': 'https://job-boards.greenhouse.io/acme/jobs/123/confirmation',

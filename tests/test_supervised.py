@@ -274,7 +274,7 @@ class PreparationTests(SupervisedBase):
         self.make_cv(job)
         workflow.decide(job, workflow.APPROVE_APPLY, channel='dashboard', token=self.state(job)['token'])
         with mock.patch.object(adapters, 'ADAPTERS', [adapter]), \
-                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
+                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
             self.assertEqual(self.process_applications(), ['manual_action_required'])
         self.assertEqual(adapter.submits, 0)
 

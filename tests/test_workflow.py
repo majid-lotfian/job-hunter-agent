@@ -123,7 +123,8 @@ class Base(unittest.TestCase):
             return db.execute(
                 "INSERT INTO jobs (source,source_id,company,employer,title,location,description,url,apply_url,discovered_at,score,"
                 "availability,relevance_tier) VALUES (?,?,?,?,?,'Amsterdam','We need Python, RAG and LLM agents.',?,?,'now',?,'active','primary')",
-                (source, os.urandom(4).hex(), 'acme', 'Acme', title, url or f'https://jobs.example/{os.urandom(3).hex()}',
+                (source, 't' + os.urandom(4).hex(), 'acme',   # never all digits (= a real Greenhouse id)
+                  'Acme', title, url or f'https://jobs.example/{os.urandom(3).hex()}',
                  url, score)).lastrowid
 
     def make_cv(self, job_id):
@@ -227,7 +228,7 @@ class AutoCvWorkflowTests(Base):
         with core.connect() as db:
             db.execute("UPDATE jobs SET description='new requirements' WHERE id=?", (job,))
         with mock.patch.object(adapters, 'ADAPTERS', [LiveMockAdapter()]), \
-                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
+                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
             self.assertEqual(self.process_applications(), ['manual_action_required'])
         self.assertIn('changed after your approval', self.apps(job)[0]['last_error'])
         self.assertEqual(self.state(job)['actions'], [workflow.APPROVE_APPLY, workflow.REJECT])   # re-approval offered
@@ -248,7 +249,7 @@ class ApprovalWorkflowTests(Base):
         run(cv_pipeline.process(job, FakeProvider(good_reply)))
         self.assertEqual(self.apps(job)[0]['status'], 'queued')             # no second approval needed
         with mock.patch.object(adapters, 'ADAPTERS', [LiveMockAdapter()]), \
-                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
+                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
             self.assertEqual(self.process_applications(), ['submitted'])
         app = self.apps(job)[0]
         self.assertEqual((app['external_id'], self.job(job)['status']), ('EXT-1', 'applied'))
@@ -344,7 +345,7 @@ class ApplicationStateTests(Base):
     def test_live_requires_listed_live_capable_adapter(self):
         job = self.approved_job()
         adapter = LiveMockAdapter()
-        with mock.patch.object(adapters, 'ADAPTERS', [adapter]), mock.patch.dict(os.environ, {'APPLY_MODE': 'live'}):
+        with mock.patch.object(adapters, 'ADAPTERS', [adapter]), mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*'}):
             self.assertEqual(self.process_applications(), ['dry_run'])      # not listed in APPLY_LIVE_ADAPTERS
         self.assertEqual(adapter.submits, 0)
         self.assertNotEqual(self.job(job)['status'], 'applied')
@@ -353,7 +354,7 @@ class ApplicationStateTests(Base):
         job = self.approved_job()
         adapter = LiveMockAdapter(result=adapters.Result(adapters.SUBMITTED, 'sent'))
         with mock.patch.object(adapters, 'ADAPTERS', [adapter]), \
-                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
+                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
             self.assertEqual(self.process_applications(), ['manual_action_required'])
         self.assertNotEqual(self.job(job)['status'], 'applied')
 
@@ -361,7 +362,7 @@ class ApplicationStateTests(Base):
         job = self.approved_job()
         adapter = LiveMockAdapter(result=adapters.Result(adapters.RETRY, 'HTTP 503'))
         with mock.patch.object(adapters, 'ADAPTERS', [adapter]), \
-                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': 'mocklive', 'APPLY_MAX_ATTEMPTS': '2'}):
+                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*', 'APPLY_LIVE_ADAPTERS': 'mocklive', 'APPLY_MAX_ATTEMPTS': '2'}):
             self.assertEqual(self.process_applications(), ['queued'])
             self.assertIsNotNone(self.apps(job)[0]['next_attempt_at'])
             with core.connect() as db:
@@ -369,7 +370,7 @@ class ApplicationStateTests(Base):
             self.assertEqual(self.process_applications(), ['failed'])
         job2 = self.approved_job()
         blocked = LiveMockAdapter(plan=adapters.Result(adapters.BLOCKED, 'CAPTCHA required'))
-        with mock.patch.object(adapters, 'ADAPTERS', [blocked]), mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
+        with mock.patch.object(adapters, 'ADAPTERS', [blocked]), mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
             self.assertEqual(self.process_applications(), ['blocked'])
         self.assertEqual(blocked.submits, 0)
         self.assertEqual(self.apps(job2)[0]['last_error'], 'CAPTCHA required')
@@ -380,7 +381,7 @@ class ApplicationStateTests(Base):
             with core.connect() as db:
                 db.execute("INSERT INTO applications (job_id, status, created_at, updated_at) VALUES (?, 'queued', 'n', 'n')", (job,))
         with mock.patch.object(adapters, 'ADAPTERS', [LiveMockAdapter()]), \
-                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
+                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
             self.assertEqual(self.process_applications(), ['submitted'])
             twin = self.approved_job(url='https://acme.example/jobs/1?utm_source=other')   # same vacancy from another source
             self.assertEqual(self.process_applications(), ['blocked'])
@@ -395,7 +396,7 @@ class ApplicationStateTests(Base):
         job2 = self.approved_job()
         crashing = LiveMockAdapter(result=RuntimeError('boom'))
         with mock.patch.object(adapters, 'ADAPTERS', [crashing]), \
-                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
+                mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*', 'APPLY_LIVE_ADAPTERS': 'mocklive'}):
             run(applications.ApplicationWorker(http_factory=no_network).run_once())
         self.assertEqual(self.apps(job2)[0]['status'], 'manual_action_required')
         self.assertEqual(crashing.submits, 1)
@@ -459,7 +460,7 @@ class PdfAttachmentTests(Base):
 
     def live(self, adapter):
         return mock.patch.object(adapters, 'ADAPTERS', [adapter]), \
-            mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': 'mocklive'})
+            mock.patch.dict(os.environ, {'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*', 'APPLY_LIVE_ADAPTERS': 'mocklive'})
 
     def test_attachment_is_the_current_pdf_and_html_stays_available(self):
         job = self.approved()

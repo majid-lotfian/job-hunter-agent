@@ -39,8 +39,15 @@ def settings():
     mode = os.getenv('APPLY_MODE', 'off').strip().lower()
     return {'mode': mode if mode in ('off', 'dry_run', 'live') else 'off',
             'live_adapters': {x.strip() for x in os.getenv('APPLY_LIVE_ADAPTERS', '').split(',') if x.strip()},
+            # live submission only for these job ids ("*" = every approved job); anything else is prepared for review
+            'live_jobs': {x.strip() for x in os.getenv('APPLY_LIVE_JOB_IDS', '').split(',') if x.strip()},
             'max_attempts': max(1, int(os.getenv('APPLY_MAX_ATTEMPTS', '3') or 3)),
             'retry_base': max(30, int(os.getenv('APPLY_RETRY_BASE_SECONDS', '300') or 300))}
+
+
+def live_allowed(job_id, cfg=None):
+    cfg = cfg or settings()
+    return cfg['mode'] == 'live' and ('*' in cfg['live_jobs'] or str(job_id) in cfg['live_jobs'])
 
 
 def _set(db, app_id, status, **fields):
@@ -105,6 +112,8 @@ async def process(app_id, http, cfg=None):
         log.info('Application %s (job %s): %s - %s', app_id, job['id'], status, message)
         return status
 
+    if cfg['mode'] == 'live' and not live_allowed(job['id'], cfg):
+        cfg = {**cfg, 'mode': 'off'}            # live mode is scoped to APPLY_LIVE_JOB_IDS: this job is only prepared
     # 1. the approval must still match the job and CV that exist now
     if approval is None or approval['status'] != 'active':
         return finish('manual_action_required', 'Approval is no longer active - approve again.', detail={'reapprove': True})
