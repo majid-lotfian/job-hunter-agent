@@ -1,6 +1,6 @@
 # Mobile manual-application workflow: Telegram CV PDF, Open / I Submitted / Submit Later, user-reported records
 
-- **PR:** #new (renamed after creation), **stacked on PR #16**
+- **PR:** [#17](https://github.com/majid-lotfian/job-hunter-agent/pull/17), **stacked on PR #16**
 - **Branch:** `feature/mobile-manual-apply` (from `feature/live-review-allowlist` 5468aa9)
 - **Date:** 2026-11-08 12:54 (Europe/Amsterdam) · **Author:** Claude Code (Opus 5.5)
 - **Status:** open: not merged, not deployed. One demo Telegram message was sent; **nothing was submitted or marked as submitted.**
@@ -158,4 +158,4 @@ Revert the merge commit. Manual records already made remain valid rows (status `
 
 ## 16. PR URL and commits
 
-See the PR (URL added after creation).
+https://github.com/majid-lotfian/job-hunter-agent/pull/17 · commits: 89bec2b (implementation, tests, README, report), then the rename commit.
