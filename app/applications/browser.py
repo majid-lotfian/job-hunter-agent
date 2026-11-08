@@ -17,11 +17,13 @@ Configuration (.env):
     BROWSER_WORKER_REGION=europe-west4
     BROWSER_WORKER_GCLOUD_CONFIG=/home/<user>/job-hunter-agent/data/gcloud   # gcloud config dir with the worker-dispatch SA
     BROWSER_WORKER_TIMEOUT_SECONDS=300
+    BROWSER_WORKER_EVIDENCE_DIR=...     # local backend: private copy of every run (default data/applications)
 """
 import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,7 +48,8 @@ def settings():
             'gcloud_config': os.getenv('BROWSER_WORKER_GCLOUD_CONFIG', '').strip(),
             'timeout': int(os.getenv('BROWSER_WORKER_TIMEOUT_SECONDS', '300') or 300),
             'python': os.getenv('BROWSER_WORKER_PYTHON', sys.executable),
-            'channel': os.getenv('BROWSER_WORKER_CHANNEL', '').strip()}
+            'channel': os.getenv('BROWSER_WORKER_CHANNEL', '').strip(),
+            'evidence_root': os.getenv('BROWSER_WORKER_EVIDENCE_DIR', '').strip() or str(ROOT / 'data' / 'applications')}
 
 
 def eligibility(job, package):
@@ -110,8 +113,34 @@ def _run_local(pkg, cfg, workdir):
            '--evidence-dir', str(workdir / 'evidence')]
     if cfg['channel']:
         cmd += ['--channel', cfg['channel']]
-    subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=cfg['timeout'])
-    return json.loads(result_path.read_text(encoding='utf-8')) if result_path.is_file() else None
+    try:
+        done = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=cfg['timeout'])
+        log_text = f'exit {done.returncode}\n{done.stdout[-4000:]}\n{done.stderr[-8000:]}'
+    except subprocess.TimeoutExpired as exc:
+        log_text = f'timeout after {cfg["timeout"]} s\n{exc.stderr or ""}'
+    result = json.loads(result_path.read_text(encoding='utf-8')) if result_path.is_file() else None
+    (workdir / 'worker.log').write_text(str(log_text), encoding='utf-8')
+    kept = keep_evidence(pkg, workdir, cfg)
+    if result is not None:
+        result['evidence_dir'] = str(kept)
+    return result
+
+
+def keep_evidence(pkg, workdir, cfg):
+    """Keep a private copy (folder 700, files 600) of the run's package, result, worker log and screenshots."""
+    from datetime import datetime
+    dest = Path(cfg['evidence_root']) / f"app-{pkg['application_id']}-job-{pkg['job_id']}-{datetime.now():%Y%m%d-%H%M%S}"
+    dest.mkdir(parents=True, exist_ok=True)
+    os.chmod(dest, 0o700)
+    for item in workdir.iterdir():
+        target = dest / item.name
+        if item.is_dir():
+            shutil.copytree(item, target, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, target)
+    for path in [dest, *dest.rglob('*')]:
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
+    return dest
 
 
 def _gcloud(args, cfg, timeout):
@@ -178,5 +207,6 @@ async def submit(app, job, package, cv, submit_now=True, cfg=None):
         except Exception as exc:
             log.exception('Browser worker dispatch failed for application %s', app['id'])
             return adapters.Result(adapters.MANUAL, f'browser worker error ({type(exc).__name__}) - outcome unknown, check before retrying')
-    log.info('Browser worker for application %s: %s - %s', app['id'], (result or {}).get('status'), (result or {}).get('reason'))
+    log.info('Browser worker for application %s: %s - %s (evidence: %s)', app['id'], (result or {}).get('status'),
+             (result or {}).get('reason'), (result or {}).get('evidence_dir', 'none'))
     return map_result(result)
