@@ -26,12 +26,19 @@ LABELS = {APPROVE_APPLY: 'Approve & Apply', APPROVE_CV_APPLY: 'Approve CV & Appl
 PREPARE_LABELS = {APPROVE_APPLY: 'Prepare Application', APPROVE_CV_APPLY: 'Prepare Application + CV', REJECT: 'Reject'}
 
 
-def supervised():
-    return os.getenv('APPLY_MODE', 'off').strip().lower() != 'live'
+def supervised(job_id=None):
+    """True when an approval only prepares the application. Live mode is scoped to APPLY_LIVE_JOB_IDS ("*" = all):
+    for any other job an approval still only prepares it."""
+    if os.getenv('APPLY_MODE', 'off').strip().lower() != 'live':
+        return True
+    if job_id is None:
+        return False
+    ids = {x.strip() for x in os.getenv('APPLY_LIVE_JOB_IDS', '').split(',') if x.strip()}
+    return not ('*' in ids or str(job_id) in ids)
 
 
-def labels():
-    return PREPARE_LABELS if supervised() else LABELS
+def labels(job_id=None):
+    return PREPARE_LABELS if supervised(job_id) else LABELS
 CLOSED_JOB_STATUSES = ('rejected', 'applied', 'interview', 'closed')
 LIVE_APP_STATES = ('awaiting_cv', 'queued', 'submitting', 'submitted', 'confirmed')
 
@@ -131,7 +138,7 @@ def job_state(job_id):
         detail['summary'] = {'missing': len(package.get('missing') or []), 'questions': len(package.get('questions') or []),
                              'captcha': package.get('captcha'), 'ready': package.get('ready')}
     return {'workflow': workflow_for(job['score']), 'actions': available_actions(job, cv_row, live, last),
-            'token': action_token(job, cv_ver), 'cv_version': cv_ver, 'action_labels': labels(),
+            'token': action_token(job, cv_ver), 'cv_version': cv_ver, 'action_labels': labels(job_id),
             'application_id': last['id'] if last else None,
             'application_status': last['status'] if last else None,
             'application_detail': detail,
@@ -169,7 +176,7 @@ def decide(job_id, action, *, channel, token, actor=None):
             return Decision(result='stale', message='This action is outdated (job or CV changed). Use the latest message or the dashboard.')
         allowed = available_actions(job, cv_row, live, last)
         if action not in allowed:
-            return Decision(result='not_available', message=f'Not available now ({", ".join(labels()[a] for a in allowed) or "no actions"})')
+            return Decision(result='not_available', message=f'Not available now ({", ".join(labels(job_id)[a] for a in allowed) or "no actions"})')
         jv = job_version(job)
         now = now_iso()
         if action == REJECT:
@@ -192,7 +199,7 @@ def decide(job_id, action, *, channel, token, actor=None):
             db.execute("INSERT INTO applications (job_id, approval_id, status, job_version, cv_version, apply_url, created_at, updated_at) "
                        "VALUES (?,?,?,?,?,?,?,?)", (job_id, approval_id, 'queued', jv, cv_ver, apply_url, now, now))
             _event(db, job_id, 'approved', f'{channel}: Approve & Apply (CV {cv_ver})')
-            return Decision(result='approved', message='Approved - preparing the application for your review' if supervised()
+            return Decision(result='approved', message='Approved - preparing the application for your review' if supervised(job_id)
                             else 'Approved - application queued')
         db.execute("INSERT INTO applications (job_id, approval_id, status, job_version, apply_url, created_at, updated_at) "
                    "VALUES (?,?,?,?,?,?,?)", (job_id, approval_id, 'awaiting_cv', jv, apply_url, now, now))
@@ -204,7 +211,7 @@ def decide(job_id, action, *, channel, token, actor=None):
     else:
         cv_pipeline.enqueue(job_id, 'approved', force=bool(row and row['status'] in ('ready', 'needs_review')))
         set_cv_job(job_id, 'pending', reason='approved')
-    return Decision(result='cv_queued', message='Approved - generating the CV, then preparing the application' if supervised()
+    return Decision(result='cv_queued', message='Approved - generating the CV, then preparing the application' if supervised(job_id)
                     else 'Approved - generating CV, then applying')
 
 
@@ -245,7 +252,7 @@ def _pause(db, app, now, reason):
 # --------------------------------------------------------------------------- Telegram messages
 
 def keyboard(job_id, actions, token):
-    names = labels()
+    names = labels(job_id)
     return {'inline_keyboard': [[{'text': names[a], 'callback_data': f'wf:{CODE_FOR[a]}:{job_id}:{token}'} for a in actions]]}
 
 
@@ -267,7 +274,7 @@ def action_message(job, state, cv_row=None):
                      f"(PDF: {dashboard_base()}/api/jobs/{job['id']}/cv.pdf)")
     from .applications import adapters   # lazy: applications imports this module
     adapter = adapters.select_adapter(job)
-    if supervised():
+    if supervised(job['id']):
         lines.append(f'Application system: {adapter.name} - you submit in your browser (automatic submission is off).')
     elif adapter.live_capable:
         lines.append(f'Application system: {adapter.name} - after approval it is submitted automatically ONLY if the '
@@ -279,7 +286,7 @@ def action_message(job, state, cv_row=None):
     hint = ({APPROVE_APPLY: 'Prepare Application = check the vacancy, match your profile to the form and assemble the CV PDF '
                             'for your review. You submit it yourself.',
              APPROVE_CV_APPLY: 'Prepare Application + CV = generate + validate the CV, then prepare the application for your review.'}
-            if supervised() else
+            if supervised(job['id']) else
             {APPROVE_APPLY: 'Approve & Apply submits this CV version.',
              APPROVE_CV_APPLY: 'Approve CV & Apply = generate + validate the CV, then apply (no second approval).'})
     lines += [hint[a] for a in state['actions'] if a in hint]

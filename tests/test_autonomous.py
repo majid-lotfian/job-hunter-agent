@@ -15,7 +15,7 @@ from app import applications, core, workflow  # noqa: E402
 from app.applications import adapters, feasibility  # noqa: E402
 from app.discovery.http import HttpClient  # noqa: E402
 
-LIVE = {'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': 'recruitee'}
+LIVE = {'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*', 'APPLY_LIVE_ADAPTERS': 'recruitee'}
 OFFER = {'offer': {'options_cv': 'required', 'options_phone': 'required', 'options_cover_letter': 'optional',
                    'options_photo': 'off', 'careers_apply_url': 'https://acme.recruitee.com/o/ai-engineer/c/new',
                    'locations_question_required': True, 'location_question_visible': False,
@@ -117,7 +117,7 @@ class AutonomousTests(SupervisedBase):
         self.assertEqual(self.run_apps(emp, env={'APPLY_MODE': 'off', 'APPLY_LIVE_ADAPTERS': 'recruitee'}), ['manual_action_required'])
         self.assertTrue(json.loads(self.apps(job)[0]['detail'])['package']['autonomous']['possible'])   # eligible, but off
         job2 = self.approve()
-        self.assertEqual(self.run_apps(emp, env={'APPLY_MODE': 'live', 'APPLY_LIVE_ADAPTERS': ''}), ['dry_run'])
+        self.assertEqual(self.run_apps(emp, env={'APPLY_MODE': 'live', 'APPLY_LIVE_JOB_IDS': '*', 'APPLY_LIVE_ADAPTERS': ''}), ['dry_run'])
         self.assertEqual(emp.posts, [])
 
     def test_validation_error_is_blocked_without_marking_applied(self):
