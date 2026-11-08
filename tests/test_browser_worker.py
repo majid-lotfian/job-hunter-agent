@@ -141,6 +141,30 @@ class BrowserIntegrationTests(SupervisedBase):
         self.assertEqual(_digest('A&amp;nbsp;B'), _digest('A B'))
         self.assertNotEqual(_digest('Build Junie'), _digest('Build Junie CLI'))
 
+    def test_phone_read_back_accepts_regrouped_spaces_only(self):
+        import sys as _sys
+        _sys.path.insert(0, str(WORKER.parent))
+        from apply_worker import same_value
+        self.assertTrue(same_value('phone', '+31 6 12345678', '+31 6 1234 5678'))
+        self.assertFalse(same_value('phone', '+31 6 12345679', '+31 6 1234 5678'))   # different number
+        self.assertFalse(same_value('phone', '06 12345678', '+31 6 1234 5678'))      # different form: not assumed equal
+        self.assertFalse(same_value('text', 'Test  Candidate', 'Test Candidate'))   # other fields: exact
+
+    def test_recruitee_package_carries_stable_names_and_dutch_labels(self):
+        job = {'id': 5, 'source': 'recruitee:conclusion', 'source_id': 'x', 'apply_url': 'https://conclusion.recruitee.com/o/x/c/new'}
+        package = {'apply_page': job['apply_url'], 'fields': [
+            {'key': 'name', 'label': 'Full name', 'kind': 'text', 'value': 'A', 'required': True, 'status': 'ok', 'source': 'profile:full_name'},
+            {'key': 'cv', 'label': 'CV (PDF)', 'kind': 'file', 'value': 'x', 'required': True, 'status': 'ok', 'source': 'cv_pdf'},
+            {'key': 'photo', 'label': 'Photo', 'kind': 'file', 'value': None, 'required': False, 'status': 'optional', 'source': None}]}
+        pkg = browser.build_worker_package({'id': 1}, job, package, '/tmp/cv.pdf', submit=False)
+        fields = {f['key']: f for f in pkg['fields']}
+        self.assertEqual(set(fields), {'name', 'cv'})                        # optional photo is never sent
+        self.assertEqual(fields['name']['selectors'], ['[name="candidate.name"]'])
+        self.assertIn('Volledige naam', fields['name']['aliases'])
+        self.assertEqual(fields['cv']['selectors'], ['input[type="file"][name="candidate.cv"]'])
+        gh = browser.build_worker_package({'id': 1}, {**job, 'source': 'greenhouse:acme', 'source_id': '1'}, package, '/tmp/cv.pdf', False)
+        self.assertEqual(gh['fields'][0]['selectors'], [])                    # other systems: labels as before
+
     def test_mapping(self):
         R = adapters
         self.assertEqual(browser.map_result(CONFIRMED).status, R.SUBMITTED)
@@ -233,6 +257,47 @@ class MockFormBrowserTests(unittest.TestCase):
     def test_real_greenhouse_widgets_combobox_and_checkbox_list(self):
         r = self.run_worker('greenhouse_react.html', self.GH_REACT)
         self.assertEqual((r['status'], r['missing']), ('submitted', []), r)
+
+    @staticmethod
+    def recruitee_fields(hints=True, aliases=True):
+        from app.applications.browser import field_hints
+        rows = [('name', 'Full name', 'text', 'Test Candidate'), ('email', 'Email', 'email', 'candidate@example.org'),
+                ('phone', 'Phone', 'phone', '+31 6 1234 5678'), ('cv', 'CV (PDF)', 'file', 'cv_pdf')]
+        out = []
+        for key, label, kind, value in rows:
+            selectors, alias = field_hints('recruitee', key)
+            out.append({'key': key, 'label': label, 'kind': kind, 'value': value, 'required': True,
+                        'selectors': selectors if hints else [], 'aliases': alias if aliases else []})
+        return out
+
+    def test_dutch_recruitee_form_by_stable_names(self):
+        r = self.run_worker('recruitee_nl.html', self.recruitee_fields())
+        self.assertEqual((r['status'], r['missing']), ('submitted', []), r)
+        self.assertTrue(r['verified_before_submit'])
+        self.assertIn('name=Test Candidate email=candidate@example.org phone=+31 6 12345678 cv=1 photo=0 cover=0 submits=1',
+                      r['evidence']['confirmation_text'])                     # CV in the CV field, never the photo
+
+    def test_dutch_recruitee_form_by_dutch_labels_only(self):
+        r = self.run_worker('recruitee_nl.html', self.recruitee_fields(hints=False))
+        self.assertEqual(r['status'], 'submitted', r)
+        self.assertIn('cv=1 photo=0 cover=0', r['evidence']['confirmation_text'])
+
+    def test_english_recruitee_form_by_english_labels(self):
+        fields = self.recruitee_fields(hints=False, aliases=False)
+        fields[2]['label'], fields[3]['label'] = 'Phone number', 'CV'           # labels exactly as the English page shows
+        r = self.run_worker('recruitee_nl.html?lang=en', fields)
+        self.assertEqual(r['status'], 'submitted', r)
+        self.assertIn('cv=1 photo=0 cover=0', r['evidence']['confirmation_text'])
+
+    def test_unknown_labels_never_guess_a_file_input(self):
+        r = self.run_worker('recruitee_nl.html', self.recruitee_fields(hints=False, aliases=False))
+        self.assertEqual((r['status'], r['submitted_clicked']), ('failed', False), r)
+        self.assertEqual(set(r['missing']), {'Full name', 'Email', 'Phone', 'CV (PDF)'})   # not attached to "Foto"
+
+    def test_dry_run_on_dutch_form_reads_every_value_back(self):
+        r = self.run_worker('recruitee_nl.html', self.recruitee_fields(), submit=False)
+        self.assertEqual((r['status'], r['submitted_clicked'], r['missing'], r['cleared']), ('filled', False, [], []), r)
+        self.assertTrue(r['verified_before_submit'])
 
     def test_resume_autofill_overwrite_is_undone_before_submit(self):
         r = self.run_worker('greenhouse_react.html?autofill=fast', self.GH_REACT)

@@ -88,6 +88,27 @@ def form_url(job, package):
     return page
 
 
+# Stable control names of Recruitee's hosted application form (same in every language) and the Dutch labels it
+# renders for Dutch-language vacancies. The worker tries selectors first, then the English label, then the aliases.
+RECRUITEE_FIELDS = {
+    'name': (['[name="candidate.name"]'], ['Volledige naam', 'Naam']),
+    'email': (['[name="candidate.email"]'], ['E-mailadres', 'E-mail']),
+    'phone': (['[name="candidate.phone"]'], ['Telefoonnummer', 'Telefoon']),
+    'cv': (['input[type="file"][name="candidate.cv"]'], ['Cv', 'CV']),
+    'cover_letter': (['textarea[name="candidate.coverLetter"]', 'input[type="file"][name="candidate.coverLetterFile"]'],
+                     ['Motivatiebrief', 'Motivatie']),
+    'photo': (['input[type="file"][name="candidate.photo"]'], ['Foto']),
+}
+
+
+def field_hints(ats, key):
+    """(selectors, aliases) the worker may use to find a field; empty for systems without known stable names."""
+    if ats == 'recruitee' and key in RECRUITEE_FIELDS:
+        selectors, aliases = RECRUITEE_FIELDS[key]
+        return list(selectors), list(aliases)
+    return [], []
+
+
 def build_worker_package(app, job, package, cv_pdf_location, submit):
     """Only fields with a verified value; the CV field points at the PDF. Nothing else leaves the VM."""
     fields = []
@@ -95,8 +116,9 @@ def build_worker_package(app, job, package, cv_pdf_location, submit):
         if row['status'] != 'ok':
             continue
         value = 'cv_pdf' if row['source'] == 'cv_pdf' else row['value']
+        selectors, aliases = field_hints((job['source'] or '').split(':')[0], row['key'])
         fields.append({'label': row['label'], 'key': row['key'], 'kind': row['kind'], 'value': value,
-                       'required': bool(row['required'])})
+                       'required': bool(row['required']), 'selectors': selectors, 'aliases': aliases})
     return {'version': 1, 'application_id': app['id'], 'job_id': job['id'], 'apply_url': form_url(job, package),
             'ats': (job['source'] or '').split(':')[0], 'cv_pdf': str(cv_pdf_location),
             'cv_filename': _cv_filename(package),

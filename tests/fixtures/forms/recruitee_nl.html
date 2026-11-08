@@ -1,0 +1,34 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Conclusion - Mock Recruitee (NL)</title></head><body>
+<!-- Mirrors the live Recruitee form of a Dutch vacancy (2026-11): Dutch labels with a non-breaking space + "*",
+     stable names candidate.*, and three file inputs in this order: photo, CV, cover letter. ?lang=en = English labels. -->
+<h1>Senior Software Developer (AI) (mock)</h1>
+<form id="f" novalidate>
+  <div><label for="c-name"></label><input id="c-name" type="text" name="candidate.name" required></div>
+  <div><label for="c-email"></label><input id="c-email" type="email" name="candidate.email" required></div>
+  <div><label for="c-phone"></label><input id="c-phone" type="tel" name="candidate.phone" required></div>
+  <div><label for="c-photo"></label><input id="c-photo" type="file" name="candidate.photo"></div>
+  <div class="upload"><label for="c-cv"></label><input id="c-cv" type="file" name="candidate.cv" required><span class="fname"></span></div>
+  <div><label for="c-cl"></label><input id="c-cl" type="file" name="candidate.coverLetterFile"></div>
+  <button type="submit">Versturen</button>
+</form>
+<script>
+const en = new URLSearchParams(location.search).get('lang') === 'en';
+const L = en ? {name: 'Full name', email: 'Email', phone: 'Phone number', photo: 'Photo', cv: 'CV', cl: 'Cover letter'}
+             : {name: 'Volledige naam', email: 'E-mailadres ', phone: 'Telefoonnummer', photo: 'Foto', cv: 'Cv', cl: 'Motivatiebrief'};
+const req = {name: 1, email: 1, phone: 1, cv: 1};
+for (const [k, id] of [['name', 'c-name'], ['email', 'c-email'], ['phone', 'c-phone'], ['photo', 'c-photo'], ['cv', 'c-cv'], ['cl', 'c-cl']])
+  document.querySelector(`label[for="${id}"]`).textContent = L[k] + (req[k] ? ' *' : '');
+// like Recruitee's PhoneInput: "+31 6 1234 5678" is shown as "+31 6 12345678" (same number, regrouped)
+document.getElementById('c-phone').addEventListener('input', e => {
+  const m = e.target.value.replace(/\s+/g, '').match(/^(\+\d{2})(\d)(\d+)$/);
+  if (m) e.target.value = `${m[1]} ${m[2]} ${m[3]}`; });
+document.getElementById('c-cv').addEventListener('change', e => { document.querySelector('.fname').textContent = e.target.files[0] ? e.target.files[0].name : ''; });
+document.getElementById('f').addEventListener('submit', ev => {
+  ev.preventDefault(); window.__submits = (window.__submits || 0) + 1;
+  const v = id => document.getElementById(id).value, n = id => document.getElementById(id).files.length;
+  if (!v('c-name') || !v('c-email') || !v('c-phone') || !n('c-cv')) { const e = document.createElement('div'); e.setAttribute('role', 'alert');
+    e.textContent = 'Dit veld is verplicht'; document.body.append(e); return; }
+  document.body.innerHTML = '<h2>Bedankt voor je sollicitatie!</h2><p>Ontvangen: name=' + v('c-name') + ' email=' + v('c-email') + ' phone=' + v('c-phone')
+    + ' cv=' + n('c-cv') + ' photo=' + n('c-photo') + ' cover=' + n('c-cl') + ' submits=' + window.__submits + '</p>';
+});
+</script></body></html>
