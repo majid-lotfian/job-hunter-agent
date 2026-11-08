@@ -1,6 +1,6 @@
 # PR #15 deployment, dry runs for JetBrains #38 and Adyen #15, per-job live allowlist and Telegram review
 
-- **PR:** #new (renamed after creation)
+- **PR:** [#16](https://github.com/majid-lotfian/job-hunter-agent/pull/16)
 - **Branch:** `feature/live-review-allowlist` (from `main` 6868ae2)
 - **Date:** 2026-11-08 12:07 (Europe/Amsterdam) · **Author:** Claude Code (Opus 5.5)
 - **Status:** open: not merged, not deployed. **No application was submitted in this task.** `APPLY_MODE=off`.
@@ -202,4 +202,4 @@ All rows of §4 are implemented and unit-tested. The Telegram send is **not live
 
 ## 16. PR URL and commits
 
-See the PR (URL added after creation).
+https://github.com/majid-lotfian/job-hunter-agent/pull/16 · commits: b6d6606 (code + tests), report commit, rename commit.
