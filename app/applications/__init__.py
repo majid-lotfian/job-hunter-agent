@@ -386,6 +386,20 @@ async def send_application_updates(sender=None, limit=10):
                 db.execute('UPDATE applications SET notified_at=? WHERE id=?', (now_iso(), r['id']))
             continue
         detail = json.loads(r['detail'] or '{}')
+        from . import manual
+        if manual.manual_candidate(r) and sender is None:   # an injected text sender (tests) gets the plain update
+            # mobile manual workflow: CV PDF as a Telegram document + Open / I Submitted / Submit Later buttons
+            sent_ok, why = await manual.send_manual_notification(r['id'])
+            if sent_ok:
+                sent += 1
+                continue
+            if why == 'already notified':
+                with connect() as db:
+                    db.execute('UPDATE applications SET notified_at=? WHERE id=?', (now_iso(), r['id']))
+                continue
+            if 'Telegram' in why:
+                continue                  # delivery failed or not configured: nothing marked, retried next time
+            log.info('Manual notification for application %s not sent (%s); plain update instead', r['id'], why)
         if detail.get('prepared') and r['status'] in ('manual_action_required', 'dry_run'):
             pkg = detail.get('package') or {}
             lines = [f"Application ready for review: {r['title']} — {r['employer'] or r['company']} ({r['score']}/100)",
