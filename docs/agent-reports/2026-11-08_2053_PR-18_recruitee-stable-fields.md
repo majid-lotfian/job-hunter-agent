@@ -1,6 +1,6 @@
 # Recruitee forms by stable field names (Dutch and English), no file-input guessing, phone read-back
 
-- **PR:** #new (renamed after creation)
+- **PR:** [#18](https://github.com/majid-lotfian/job-hunter-agent/pull/18)
 - **Branch:** `feature/recruitee-stable-fields` (from `main` 2aaa14c)
 - **Date:** 2026-11-08 20:53 (Europe/Amsterdam) · **Author:** Claude Code (Opus 5.5)
 - **Status:** open: not merged, not deployed. **No application was submitted.** `APPLY_MODE=off`; no other service changed.
@@ -155,4 +155,4 @@ Revert the merge commit.
 
 ## 16. PR URL and commits
 
-See the PR (URL added after creation).
+https://github.com/majid-lotfian/job-hunter-agent/pull/18 · commits: 1592fc3 (code, tests, report), then the rename commit.
