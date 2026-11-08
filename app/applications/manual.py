@@ -17,6 +17,7 @@ no external_id and no confirmed_at (those stay reserved for employer-verified co
 
     .venv/bin/python -m app.applications.manual --list                 # applications waiting for manual submission
     .venv/bin/python -m app.applications.manual --notify 12            # (re)send the message for application 12
+    .venv/bin/python -m app.applications.manual --route-blocked 12     # CAPTCHA-blocked application -> manual workflow
 """
 import argparse
 import asyncio
@@ -216,6 +217,32 @@ def handle_callback(data, *, user_id):
     return out
 
 
+def route_blocked_to_manual(app_id, *, actor):
+    """Hand an application that a CAPTCHA/human-verification challenge blocked (before this workflow existed) to the
+    manual workflow. The blocked outcome stays in the audit history and in detail['blocked']; nothing is resent."""
+    from .browser import is_human_verification
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        app = _app_row(db, app_id)
+        if app is None:
+            raise LookupError('Unknown application')
+        if app['status'] != 'blocked':
+            raise ValueError(f"application is {app['status'].replace('_', ' ')}, not blocked")
+        if not is_human_verification(app['last_error']):
+            raise ValueError('not blocked by a CAPTCHA / human-verification challenge - left as it is')
+        detail = json.loads(app['detail'] or '{}')
+        if not detail.get('package'):
+            raise ValueError('no prepared package for this application')
+        message = ('A CAPTCHA / human-verification challenge stopped the automatic attempt - nothing was submitted. '
+                   'Apply manually with the CV PDF and link sent to Telegram.')
+        detail.update(prepared=True, blocked={'status': 'blocked', 'reason': app['last_error'], 'at': app['updated_at']},
+                      reason=message, missing=list(detail['package'].get('missing') or []) + list(detail['package'].get('questions') or []))
+        _set(db, app_id, 'manual_action_required', last_error=message, detail=json.dumps(detail), notified_at=None)
+        _event(db, app['job_id'], 'routed_to_manual', f"application {app_id} ({actor}): blocked by CAPTCHA -> manual workflow; "
+                                                      f"original outcome kept: {(app['last_error'] or '')[:200]}")
+    return True
+
+
 def pending_manual(limit=50):
     with connect() as db:
         rows = db.execute("SELECT a.*, j.title, j.employer, j.company, j.status AS job_status FROM applications a "
@@ -228,7 +255,18 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog='python -m app.applications.manual', description=__doc__.split('\n')[0])
     ap.add_argument('--list', action='store_true')
     ap.add_argument('--notify', type=int, metavar='APPLICATION_ID', help='(re)send the manual-application message')
+    ap.add_argument('--route-blocked', type=int, metavar='APPLICATION_ID',
+                    help='move a CAPTCHA-blocked application to the manual workflow and send its message')
     args = ap.parse_args(argv)
+    if args.route_blocked:
+        try:
+            route_blocked_to_manual(args.route_blocked, actor='cli')
+        except (LookupError, ValueError) as exc:
+            print(f'NOT routed: {exc}')
+            return 1
+        sent, reason = asyncio.run(send_manual_notification(args.route_blocked))
+        print('routed to manual; message ' + ('sent' if sent else f'NOT sent: {reason}'))
+        return 0 if sent else 1
     if args.notify:
         sent, reason = asyncio.run(send_manual_notification(args.notify, force=True))
         print('sent' if sent else f'NOT sent: {reason}')

@@ -233,4 +233,16 @@ async def submit(app, job, package, cv, submit_now=True, cfg=None):
             return adapters.Result(adapters.MANUAL, f'browser worker error ({type(exc).__name__}) - outcome unknown, check before retrying')
     log.info('Browser worker for application %s: %s - %s (evidence: %s)', app['id'], (result or {}).get('status'),
              (result or {}).get('reason'), (result or {}).get('evidence_dir', 'none'))
-    return map_result(result)
+    mapped = map_result(result)
+    if result:
+        mapped.evidence = {'worker_status': result.get('status'), 'reason': result.get('reason'),
+                           'submitted_clicked': bool(result.get('submitted_clicked')), 'dir': result.get('evidence_dir'),
+                           'screenshot_sha256': (result.get('evidence') or {}).get('screenshot_sha256'),
+                           'url': (result.get('evidence') or {}).get('url')}
+    return mapped
+
+
+def is_human_verification(reason):
+    """A CAPTCHA / human-verification stop (never solved by the agent), as opposed to a login wall or form problem."""
+    text = (reason or '').lower()
+    return 'human verification' in text or 'captcha' in text or 'turnstile' in text
