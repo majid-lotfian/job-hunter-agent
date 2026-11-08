@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel
 
-from . import auth, cv_pipeline, workflow
+from . import auth, cv_pipeline, telegram_callbacks, workflow
 from .applications import ApplicationWorker
 from .core import connect, init_db, discover, get_job, cv_path, transition, log
 import json  # noqa: E402  (kept below line 15: the VM keeps a local edit at the top of this file)
@@ -55,16 +55,8 @@ async def telegram_loop():
                     cb = update.get('callback_query') or {}
                     if not cb:
                         continue
-                    message = cb.get('message') or {}
                     allowed_users = {x.strip() for x in os.getenv('TELEGRAM_ALLOWED_USER_IDS', '').split(',') if x.strip()}
-                    answer, remove = workflow.handle_telegram_callback(
-                        cb.get('data'), chat_id=(message.get('chat') or {}).get('id', ''), user_id=(cb.get('from') or {}).get('id', ''),
-                        allowed_chat=chat, allowed_users=allowed_users)
-                    await client.post(f'https://api.telegram.org/bot{token}/answerCallbackQuery', json={'callback_query_id': cb['id'], 'text': answer[:190], 'show_alert': True})
-                    if remove and message.get('message_id'):  # no second press on a decided/stale message
-                        await client.post(f'https://api.telegram.org/bot{token}/editMessageReplyMarkup',
-                                          json={'chat_id': message['chat']['id'], 'message_id': message['message_id'],
-                                                'reply_markup': {'inline_keyboard': []}})
+                    await telegram_callbacks.handle(client, token, cb, allowed_chat=chat, allowed_users=allowed_users)
             except asyncio.CancelledError:
                 raise
             except Exception:

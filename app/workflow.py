@@ -346,7 +346,7 @@ async def send_pending_actions(sender=None):
             log.exception('Telegram summary failed')
     _last_summary['count'] = rest
     from .applications import send_application_updates
-    sent += await send_application_updates(sender=send)
+    sent += await send_application_updates(sender=sender)   # None = real Telegram (manual PDF messages)
     return sent
 
 
@@ -356,9 +356,13 @@ def parse_callback(data):
     return (ACTION_CODES[m.group(1)], int(m.group(2)), m.group(3)) if m else None
 
 
+def telegram_authorized(chat_id, user_id, allowed_chat, allowed_users=None):
+    return str(chat_id) == str(allowed_chat) and (not allowed_users or str(user_id) in allowed_users)
+
+
 def handle_telegram_callback(data, *, chat_id, user_id, allowed_chat, allowed_users=None):
     """Authorize and execute a Telegram button press. Returns (answer_text, remove_buttons)."""
-    if str(chat_id) != str(allowed_chat) or (allowed_users and str(user_id) not in allowed_users):
+    if not telegram_authorized(chat_id, user_id, allowed_chat, allowed_users):
         log.warning('Rejected Telegram callback from unauthorized chat/user')
         return 'Unauthorized', False
     parsed = parse_callback(data)

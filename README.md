@@ -248,6 +248,30 @@ Keep other services and their units unchanged. The service restarts on failure a
 
 With discovery enabled, the agent sends matches and tailored CV notifications. Review the job description and generated CV before selecting **Approve & Apply** or **Reject**. Approval is tied to the specific job/CV version; changed content requires fresh approval. For missing screening answers, inspect the authenticated application review page and complete your profile. You can keep `APPLY_MODE=off` indefinitely and submit manually.
 
+### 8. Apply manually from your phone (Telegram)
+
+Whenever the agent cannot submit a job itself (CAPTCHA, unsupported form, missing answers, `APPLY_MODE=off`, or an unclear browser outcome), the prepared application is sent to Telegram **once**:
+
+- the current, validated tailored CV as a real **PDF document** (download or share it straight into the employer's upload field);
+- company, job title, match score, the direct application URL, why it is not automatic, and any missing screening questions;
+- buttons: **🌐 Open Application** (opens the employer's form), **✅ I Submitted This Application**, **⏳ Submit Later**.
+
+To record your application, tap **I Submitted This Application** after you have really submitted on the employer's site. The bot asks *"Did you successfully submit this application on the employer's website?"*; tap **Confirm** (or **Cancel**). The application is then marked **Manually submitted**:
+- status `submitted`, with `submitted_at`;
+- the source "user-reported via Telegram";
+- `employer_verified=false`. No employer reference is invented.
+
+The original message shows "✅ Manually submitted", the dashboard shows the same reason, and the job becomes `applied`. Future approvals, automatic submissions and repeated confirmations are refused.
+
+**Submit Later** keeps the application open without reminders; the buttons in that message keep working. Buttons are bound to the application's CV and job version. After a CV or posting change they are rejected as outdated, and only `TELEGRAM_CHAT_ID` / `TELEGRAM_ALLOWED_USER_IDS` can use them.
+
+These buttons are separate from **Approve & Submit** (`wf:` callbacks, autonomous submission): a manual confirmation never queues anything, never starts the browser worker and never changes `APPLY_MODE`. To list or (re)send these messages:
+
+```bash
+.venv/bin/python -m app.applications.manual --list
+.venv/bin/python -m app.applications.manual --notify <application id>
+```
+
 ## Application modes and limitations
 
 | Mode | Behavior | Appropriate use |

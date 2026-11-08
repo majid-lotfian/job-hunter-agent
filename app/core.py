@@ -315,7 +315,10 @@ async def send_telegram(text, reply_markup=None):
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(f'https://api.telegram.org/bot{token}/sendMessage', json=payload)
         resp.raise_for_status()
-    return True
+    try:
+        return resp.json().get('result') or True      # the sent message (has message_id); truthy either way
+    except ValueError:
+        return True
 
 
 async def send_telegram_document(path, caption='', filename=None):
