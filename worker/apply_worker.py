@@ -166,29 +166,53 @@ def _group(page, label):
     return None
 
 
-def _file_target(page, label):
-    """(group, file input) for an upload field: the labelled input itself, the file input inside a labelled wrapper
-    (Greenhouse: role=group "Resume/CV" around a hidden input labelled "Attach"), else the form's first file input."""
-    labelled = page.get_by_label(label, exact=False)
-    if labelled.count() and labelled.first.get_attribute('type') == 'file':
-        return None, labelled.first
-    if labelled.count() and labelled.first.locator('input[type="file"]').count():
-        return labelled.first, labelled.first.locator('input[type="file"]').first
-    if page.locator('input[type="file"]').count():
+def _alias_pattern(text):
+    """Whole visible label text, ignoring a trailing required-asterisk and (non-breaking) spaces."""
+    return re.compile(rf'^\s*{re.escape(text.strip())}\s*\*?\s*$', re.I)
+
+
+def field_locator(page, field):
+    """The form control for a package field, most stable first:
+    1. `selectors` - stable attributes the agent knows for this ATS (Recruitee: [name="candidate.email"]);
+    2. the field's (English) label, as before;
+    3. `aliases` - the same label in other languages (Recruitee renders Dutch: "E-mailadres").
+    Returns a Locator or None. Never guesses a control that matches none of these."""
+    for sel in field.get('selectors') or []:
+        loc = page.locator(sel)
+        if loc.count():
+            return loc.first
+    loc = page.get_by_label(field['label'], exact=False)
+    if loc.count():
+        return loc.first
+    for alias in field.get('aliases') or []:
+        loc = page.get_by_label(_alias_pattern(alias))
+        if loc.count():
+            return loc.first
+    return None
+
+
+def _file_target(page, field):
+    """(group, file input) for an upload field: the located control itself, the file input inside a located wrapper
+    (Greenhouse: role=group "Resume/CV" around a hidden input labelled "Attach"), or - only when the form has exactly
+    ONE file input - that input. With several file inputs (photo, CV, cover letter) nothing is guessed."""
+    el = field_locator(page, field)
+    if el is not None and el.get_attribute('type') == 'file':
+        return None, el
+    if el is not None and el.locator('input[type="file"]').count():
+        return el, el.locator('input[type="file"]').first
+    if el is None and page.locator('input[type="file"]').count() == 1:
         return None, page.locator('input[type="file"]').first
     return None, None
 
 
-def _file_attached(page, label, cv_path):
+def _file_attached(page, field, cv_path):
     """Widgets that keep the file in their own state clear (or remove) the input and show the file name instead, so
-    either a selected file or the file name inside that upload field counts as attached. The field is located by its
-    label every time - never by "first file input" once a labelled field exists (Greenhouse removes the resume's
-    input after an upload, and the next file input on the page is the cover letter's)."""
+    either a selected file or the file name inside that upload field counts as attached. The field is located again
+    every time (Greenhouse removes the resume's input after an upload; the next file input is the cover letter's)."""
     name = Path(cv_path).name
-    labelled = page.get_by_label(label, exact=False)
+    el = field_locator(page, field)
     try:
-        if labelled.count():
-            el = labelled.first
+        if el is not None:
             if el.get_attribute('type') == 'file':
                 if el.evaluate('el => el.files.length', timeout=3000) == 1:
                     return True
@@ -198,29 +222,31 @@ def _file_attached(page, label, cv_path):
             if inputs.count() and inputs.first.evaluate('el => el.files.length', timeout=3000) == 1:
                 return True
             return name in el.inner_text(timeout=3000)
-        target = page.locator('input[type="file"]').first      # unlabelled form: its first file input
-        if target.count() and target.evaluate('el => el.files.length', timeout=3000) == 1:
-            return True
-        group = target.locator('xpath=ancestor::*[@role="group" or contains(@class, "upload")][1]')
-        return group.count() > 0 and name in group.inner_text(timeout=3000)
+        if page.locator('input[type="file"]').count() == 1:  # unlabelled single-upload form
+            target = page.locator('input[type="file"]').first
+            if target.evaluate('el => el.files.length', timeout=3000) == 1:
+                return True
+            group = target.locator('xpath=ancestor::*[@role="group" or contains(@class, "upload")][1]')
+            return group.count() > 0 and name in group.inner_text(timeout=3000)
+        return False
     except Exception:
         return False
 
 
-def _attach_file(page, label, cv_path):
-    """Attach the CV to the upload field named `label` and verify it is attached."""
-    _, target = _file_target(page, label)
+def _attach_file(page, field, cv_path):
+    """Attach the CV to the upload field and verify it is attached."""
+    _, target = _file_target(page, field)
     if target is None:
         return False
     for attempt in range(2):        # a widget that was not ready ignores the file; setting it again is harmless
         target.set_input_files(str(cv_path))
         page.wait_for_timeout(1500)
-        if _file_attached(page, label, cv_path):
+        if _file_attached(page, field, cv_path):
             return True
         page.wait_for_timeout(2000)
-        if _file_attached(page, label, cv_path):
+        if _file_attached(page, field, cv_path):
             return True
-        _, target = _file_target(page, label)
+        _, target = _file_target(page, field)
         if target is None:
             return False
     return False
@@ -252,6 +278,16 @@ def _choose_in_combobox(page, box, wanted):
     return True
 
 
+def same_value(kind, shown, wanted):
+    """Read-back comparison. Phone widgets regroup spaces ("+31 6 1234 5678" -> "+31 6 12345678"), so a phone
+    counts as correct when it is the identical number (same digits, same leading +); everything else must match exactly."""
+    shown, wanted = (shown or '').strip(), str(wanted).strip()
+    if kind == 'phone':
+        norm = lambda v: ('+' if v.startswith('+') else '') + re.sub(r'\D', '', v)
+        return bool(norm(wanted).strip('+')) and norm(shown) == norm(wanted)
+    return shown == wanted
+
+
 def _as_yes_no(value):
     if isinstance(value, bool):
         return YES if value else NO
@@ -262,10 +298,11 @@ def fill_field(page, field, cv_path):
     """Fill one field and read it back. Returns True when the value is verifiably in the form."""
     label, kind, value = field['label'], field.get('kind', 'text'), field.get('value')
     if kind == 'file':
-        return _attach_file(page, label, cv_path)
+        return _attach_file(page, field, cv_path)
     if kind in ('boolean', 'single_choice', 'multi_choice'):
         wanted = [_as_yes_no(value)] if kind == 'boolean' else [(str(v),) for v in (value if isinstance(value, list) else [value])]
-        select = page.get_by_label(label, exact=False)
+        found = field_locator(page, field)
+        select = found if found is not None else page.locator('#__none__')
         if select.count() and select.first.evaluate('el => el.tagName') == 'SELECT':
             options = select.first.locator('option').all_inner_texts()
             pick = next((o for o in options if o.strip().lower() in {w.lower() for w in wanted[0]}), None)
@@ -278,7 +315,7 @@ def fill_field(page, field, cv_path):
         group = _group(page, label)
         if group is None:
             if kind == 'boolean':                      # a single consent-style checkbox
-                box = page.get_by_label(label, exact=False)
+                box = select
                 if box.count() and box.first.get_attribute('type') == 'checkbox':
                     if wanted[0] is YES:
                         box.first.check()
@@ -297,11 +334,12 @@ def fill_field(page, field, cv_path):
             option.first.check()
             ok = ok and option.first.is_checked()
         return ok
-    target = page.get_by_label(label, exact=False)
-    if not target.count():
+    target = field_locator(page, field)
+    if target is None:
         return False
-    target.first.fill(str(value))
-    return target.first.input_value().strip() == str(value).strip()
+    target.fill(str(value))
+    page.wait_for_timeout(300)                       # let input masks (phone widgets) settle before reading back
+    return same_value(kind, target.input_value(), value)
 
 
 def verify_field(page, field, cv_path):
@@ -310,10 +348,11 @@ def verify_field(page, field, cv_path):
     label, kind, value = field['label'], field.get('kind', 'text'), field.get('value')
     try:
         if kind == 'file':
-            return _file_attached(page, label, cv_path)
+            return _file_attached(page, field, cv_path)
         if kind in ('boolean', 'single_choice', 'multi_choice'):
             wanted = [_as_yes_no(value)] if kind == 'boolean' else [(str(v),) for v in (value if isinstance(value, list) else [value])]
-            el = page.get_by_label(label, exact=False)
+            found = field_locator(page, field)
+            el = found if found is not None else page.locator('#__none__')
             if el.count() and el.first.evaluate('el => el.tagName') == 'SELECT':
                 chosen = el.first.evaluate('el => el.selectedIndex >= 0 ? el.options[el.selectedIndex].text : ""').strip().lower()
                 return chosen in {w.lower() for w in wanted[0]}
@@ -331,8 +370,8 @@ def verify_field(page, field, cv_path):
                 if not any(h.count() and h.first.is_checked() for h in hits):
                     return False
             return True
-        target = page.get_by_label(label, exact=False)
-        return bool(target.count()) and target.first.input_value().strip() == str(value).strip()
+        target = field_locator(page, field)
+        return target is not None and same_value(kind, target.input_value(), value)
     except Exception:
         return False
 
@@ -341,7 +380,7 @@ TEXT_INPUTS_JS = """() => [...document.querySelectorAll('input, textarea')].filt
     ['text', 'email', 'tel', 'url', ''].includes((e.getAttribute('type') || '').toLowerCase()) || e.tagName === 'TEXTAREA')
   .filter(e => e.getAttribute('role') !== 'combobox' && e.type !== 'hidden' && e.id)
   .map(e => { const l = document.querySelector(`label[for="${CSS.escape(e.id)}"]`);
-              return [e.id, (l ? l.innerText : e.getAttribute('aria-label') || '').trim(), e.value || '']; })"""
+              return [e.id, (l ? l.innerText : e.getAttribute('aria-label') || '').trim(), e.value || '', e.name || '']; })"""
 
 
 def clear_unrequested_values(page, fields, empty_at_load):
@@ -349,10 +388,11 @@ def clear_unrequested_values(page, fields, empty_at_load):
     by the page's own autofill) are emptied again: only package values are sent. Returns their labels."""
     def norm(text):
         return re.sub(r'\s+', ' ', (text or '').replace('*', '')).strip().lower()
-    ours = {norm(f['label']) for f in fields}
+    ours = {norm(x) for f in fields for x in [f['label'], *(f.get('aliases') or [])]}
+    our_names = {m.group(1) for f in fields for sel in f.get('selectors') or [] for m in [re.search(r'\[name="([^"]+)"\]', sel)] if m}
     cleared = []
-    for el_id, label, value in page.evaluate(TEXT_INPUTS_JS):
-        if el_id in empty_at_load and value.strip() and norm(label) not in ours:
+    for el_id, label, value, name in page.evaluate(TEXT_INPUTS_JS):
+        if el_id in empty_at_load and value.strip() and norm(label) not in ours and name not in our_names:
             page.locator(f'[id="{el_id}"]').fill('')
             cleared.append(label or el_id)
     return cleared
@@ -413,7 +453,7 @@ def run(package, cv_path, evidence_dir, browser_channel=None, headless=True):
             blocker = detect_blocker(page)
             if blocker:
                 return {**result, 'status': 'blocked', 'reason': blocker}
-            empty_at_load = {i for i, _, v in page.evaluate(TEXT_INPUTS_JS) if not v.strip()}
+            empty_at_load = {i for i, _, v, _ in page.evaluate(TEXT_INPUTS_JS) if not v.strip()}
             # files first: attaching a CV can trigger the page's resume autofill, which rewrites other fields
             ordered = [f for f in package['fields'] if f.get('kind') == 'file'] + \
                       [f for f in package['fields'] if f.get('kind') != 'file']
