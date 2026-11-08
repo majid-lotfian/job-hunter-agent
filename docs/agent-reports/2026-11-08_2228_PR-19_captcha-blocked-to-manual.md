@@ -1,6 +1,6 @@
 # CAPTCHA-blocked attempts go to the manual Telegram workflow; Conclusion #74 blocked attempt; Greenhouse search
 
-- **PR:** #new (renamed after creation)
+- **PR:** [#19](https://github.com/majid-lotfian/job-hunter-agent/pull/19)
 - **Branch:** `feature/blocked-to-manual` (from `main` f8c5f74)
 - **Date:** 2026-11-08 22:28 (Europe/Amsterdam) · **Author:** Claude Code (Opus 5.5)
 - **Status:** open: not merged, not deployed. `APPLY_MODE=off`. No submission in this task. `hotel-bot` untouched.
@@ -164,4 +164,4 @@ Revert the merge commit. Applications already routed to manual remain valid manu
 
 ## 16. PR URL and commits
 
-See the PR (URL added after creation).
+https://github.com/majid-lotfian/job-hunter-agent/pull/19 · commits: faa045c (code, tests, README), report commit, rename commit.
